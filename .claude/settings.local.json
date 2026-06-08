@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(Get-ChildItem -Path \"D:\\\\D\\\\University\\\\Semester 8\\\\CC\\\\Compiler project\" -Recurse -File | Select-Object -Property FullName | ForEach-Object { $_.FullName })"
+    ]
+  }
+}
