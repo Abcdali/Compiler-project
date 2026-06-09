@@ -135,6 +135,22 @@ class SDDEngine:
             node.stype   = leaves[-1]
             node.sval    = f"{leaves[0]}:{leaves[-1]}"
 
+    def _sdd_ParamTail(self, node: Node):
+        # ParamTail → , Param ParamTail | ε   (iterated list)
+        if not node.kids:
+            node.meaning = "No more parameters"
+            node.sval    = ""
+            return
+        param = self._child(node, "Param")
+        tail  = self._child(node, "ParamTail")
+        parts = []
+        if param and param.sval:
+            parts.append(param.sval)
+        if tail and tail.sval:
+            parts.append(tail.sval)
+        node.sval    = ", ".join(parts)
+        node.meaning = "More parameters: " + (node.sval or "none")
+
     def _sdd_StmtList(self, node: Node):
         n = self._count_stmts(node)
         node.meaning = f"{n} statement(s)"
@@ -283,7 +299,8 @@ class SDDEngine:
     def _sdd_RelOp(self, node: Node):
         v = _first_leaf_value(node) or ""
         RELOP_MEANINGS = {
-            "is_it":   "==",  "is_less":  "<",  "is_grtr":  ">",
+            "is_it":   "==",  "==":       "==",
+            "is_less":  "<",  "is_grtr":  ">",
             "less=":   "<=",  "grtr=":    ">=",
             "is_less=":"<=",  "is_grtr=": ">=",
         }

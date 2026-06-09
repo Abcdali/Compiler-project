@@ -73,7 +73,7 @@ GRAMMAR = {
 
     "Condition":   [["Expr", "RelOp", "Expr"]],
 
-    "RelOp":       [["is_it"], ["is_less"], ["is_grtr"],
+    "RelOp":       [["is_it"], ["=="], ["is_less"], ["is_grtr"],
                     ["less="], ["grtr="], ["is_less="], ["is_grtr="]],
 
     "Expr":        [["Term", "ExprTail"]],

@@ -21,19 +21,37 @@ def lexer(code: str):
     operators = {
         "equalto",
         "plus", "minus", "mul", "div", "mode", "power",
-        "is_it", "not",
+        "is_it", "==", "not",
         "is_less=", "is_less",
         "is_grtr=", "is_grtr",
         "grtr=",    "grtr",
         "less=",    "less",
+        "assign",   "assign",
     }
 
     delimiters = {"((", "))", "{{", "}}", "[[", "]]"}
 
+    datatype_keywords = {"integer", "word", "decimal", "character"}
+
+    def lexical_error(word: str) -> str:
+        """Return a human-readable reason why `word` is not a valid token."""
+        if '"' in word:
+            return "Unterminated string literal"
+        if re.fullmatch(r'\d+\.\d+\.[\d.]*', word):
+            return "Malformed number (too many decimal points)"
+        if re.match(r'\d', word) and re.search(r'[a-zA-Z_]', word):
+            return "Invalid identifier (cannot start with a digit)"
+        if re.fullmatch(r'\d+\.', word) or re.fullmatch(r'\.\d+', word):
+            return "Malformed number (incomplete decimal)"
+        return f"Illegal token / unrecognized symbol '{word}'"
+
     tokens = []
     lines  = code.split('\n')
+    error_found = False   # stop tokenising at the first lexical error
 
     for line_no, line_text in enumerate(lines, start=1):
+        if error_found:
+            break
         # Tokenise one line at a time so we have accurate line numbers.
         # First, protect string literals.
         string_map = {}
@@ -46,6 +64,8 @@ def lexer(code: str):
 
         safe_line = re.sub(r'"[^"]*"', replace_string, line_text)
 
+        # Pad the '==' operator first so 'a==b' splits correctly
+        safe_line = safe_line.replace('==', ' == ')
         # Pad double-char delimiters
         for tok in ('((', '))', '{{', '}}', '[[', ']]'):
             safe_line = safe_line.replace(tok, f' {tok} ')
@@ -55,21 +75,21 @@ def lexer(code: str):
             w   = m.group()
             col = m.start() + 1          # 1-based column
 
-            # Restore string literal
-            if w.rstrip() in string_map:
-                w = string_map[w.rstrip()]
-
-            w_lower = w.lower()
-
-            if w in string_map:
+            # A protected string literal appears as its placeholder key
+            # (e.g. "__STR0__"); restore it to a real STRING token.
+            key = w.rstrip()
+            if key in string_map:
                 tokens.append({
                     "type":     "STRING",
-                    "value":    string_map[w],
+                    "value":    string_map[key],
                     "category": "STRING",
                     "line": line_no, "col": col,
                 })
+                continue
 
-            elif w_lower in keywords:
+            w_lower = w.lower()
+
+            if w_lower in keywords:
                 tok_type = "Semi" if w_lower == "semi" else w_lower
                 tokens.append({
                     "type":     tok_type,
@@ -115,7 +135,251 @@ def lexer(code: str):
                                 "category": "DELIMITER", "line": line_no, "col": col})
 
             else:
-                tokens.append({"type": "UNKNOWN", "value": w,
-                                "category": "UNKNOWN", "line": line_no, "col": col})
+                # Lexical error: record it and stop — tokens that appear
+                # AFTER the error are not produced (normal lexer behaviour).
+                tokens.append({
+                    "type":     "LEX_ERROR",
+                    "value":    w,
+                    "category": "ERROR",
+                    "error":    lexical_error(w),
+                    "line": line_no, "col": col,
+                })
+                error_found = True
+                break
 
     return tokens
+
+
+def lexical_errors(tokens):
+    """Return the list of tokens that are lexical errors."""
+    return [t for t in tokens if t.get("category") == "ERROR"]
+
+
+def syntax_errors(tokens):
+    """
+    Phase 2 — Syntax errors.
+
+    Detects unbalanced / mismatched grouping delimiters.  Unbalanced
+    '(( ))', '{{ }}' and '[[ ]]' are a SYNTAX error (they break the
+    grammatical structure), not a semantic one.
+    """
+    pairs   = {"((": "))", "{{": "}}", "[[": "]]"}
+    closers = {v: k for k, v in pairs.items()}
+    stack   = []
+    errors  = []
+
+    for tok in tokens:
+        v = tok.get("value")
+        if v in pairs:
+            stack.append(tok)
+        elif v in closers:
+            if not stack:
+                errors.append({
+                    "kind": "Syntax", "line": tok.get("line"), "col": tok.get("col"),
+                    "value": v, "error": f"Unmatched closing delimiter '{v}'",
+                })
+            else:
+                top = stack.pop()
+                if pairs[top["value"]] != v:
+                    errors.append({
+                        "kind": "Syntax", "line": tok.get("line"), "col": tok.get("col"),
+                        "value": v,
+                        "error": (f"Mismatched delimiter — expected "
+                                  f"'{pairs[top['value']]}' to close "
+                                  f"'{top['value']}' (line {top.get('line')}), "
+                                  f"found '{v}'"),
+                    })
+
+    # Anything still open was never closed.
+    for top in stack:
+        errors.append({
+            "kind": "Syntax", "line": top.get("line"), "col": top.get("col"),
+            "value": top["value"],
+            "error": f"Unclosed delimiter '{top['value']}' — missing '{pairs[top['value']]}'",
+        })
+
+    errors.sort(key=lambda e: (e.get("line") or 0, e.get("col") or 0))
+    return errors
+
+
+def semantic_errors(tokens):
+    """
+    Phase 3 — Semantic errors (token-level).
+
+    Detects two classic semantic problems:
+      - use of an identifier that was never declared, and
+      - redeclaration of an already-declared variable.
+    """
+    datatype_keywords = {"integer", "word", "decimal", "character", "logic"}
+    n = len(tokens)
+    errors   = []
+    declared = {}        # name -> token where it was first declared
+
+    def is_declaration(i):
+        """True if the identifier at index i is in a declaring position."""
+        prev = tokens[i - 1]["value"].lower() if i > 0 else ""
+        nxt  = tokens[i + 1]["value"]        if i + 1 < n else ""
+        return prev in datatype_keywords or prev == "fun" or nxt == ":"
+
+    # Pass 1 — collect declarations and flag redeclarations.
+    for i, tok in enumerate(tokens):
+        if tok.get("category") != "IDENTIFIER":
+            continue
+        if not is_declaration(i):
+            continue
+        name = tok["value"]
+        prev = tokens[i - 1]["value"].lower() if i > 0 else ""
+        if name in declared and prev in datatype_keywords:
+            errors.append({
+                "kind": "Semantic", "line": tok.get("line"), "col": tok.get("col"),
+                "value": name,
+                "error": (f"Redeclaration of '{name}' — already declared at line "
+                          f"{declared[name].get('line')}"),
+            })
+        else:
+            declared.setdefault(name, tok)
+
+    # Pass 2 — every use must refer to a declared name.
+    for i, tok in enumerate(tokens):
+        if tok.get("category") != "IDENTIFIER":
+            continue
+        if is_declaration(i):
+            continue
+        name = tok["value"]
+        if name not in declared:
+            errors.append({
+                "kind": "Semantic", "line": tok.get("line"), "col": tok.get("col"),
+                "value": name,
+                "error": f"Use of undeclared identifier '{name}'",
+            })
+
+    errors.sort(key=lambda e: (e.get("line") or 0, e.get("col") or 0))
+    return errors
+
+
+def build_symbol_table(tokens):
+    """
+    Build a symbol table from the token stream.
+
+    Columns produced for each identifier:
+      - name        : the identifier
+      - data_type   : integer / decimal / word / character / logic, or '—'
+      - scope       : 'global' (top level) or 'local (<func>)' (inside braces)
+      - info        : additional info — kind (function / parameter / variable),
+                      synthetic memory address, and a function's return value.
+
+    Identifiers are returned in order of first appearance.
+    """
+    datatype_keywords = {"integer", "word", "decimal", "character", "logic"}
+    type_size = {"integer": 4, "logic": 1, "decimal": 8,
+                 "character": 1, "word": 8}
+
+    symbols   = {}
+    order     = []
+    next_addr = 0x1000        # synthetic memory address counter
+
+    brace_depth      = 0
+    current_func     = None   # name of the function we are currently inside
+    func_brace_level = None   # brace depth at which that function's body lives
+
+    n = len(tokens)
+    i = 0
+    while i < n:
+        tok = tokens[i]
+        val = tok.get("value", "")
+        low = val.lower()
+        cat = tok.get("category")
+
+        # ── Track scope via {{ }} braces ─────────────────────────────────
+        if val == "{{":
+            brace_depth += 1
+            i += 1
+            continue
+        if val == "}}":
+            brace_depth -= 1
+            if current_func is not None and brace_depth < func_brace_level:
+                current_func = None
+                func_brace_level = None
+            i += 1
+            continue
+
+        # ── Return statement: attach return value to the enclosing func ──
+        if low == "back" and current_func and current_func in symbols:
+            parts = []
+            j = i + 1
+            while j < n and tokens[j].get("value", "").lower() not in ("semi", "}}"):
+                parts.append(tokens[j].get("value", ""))
+                j += 1
+            ret = " ".join(parts) if parts else "khali"
+            symbols[current_func]["returns"] = ret
+            i += 1
+            continue
+
+        # ── Identifiers ──────────────────────────────────────────────────
+        if cat == "IDENTIFIER":
+            prev = tokens[i - 1]["value"].lower() if i > 0 else ""
+            nxt  = tokens[i + 1]["value"]        if i + 1 < n else ""
+            nxt2 = tokens[i + 2]["value"].lower() if i + 2 < n else ""
+
+            scope = "global" if brace_depth == 0 else \
+                    (f"local ({current_func})" if current_func else "local")
+
+            if prev == "fun":
+                # Function definition — its body opens one brace level deeper.
+                kind, dtype = "function", "—"
+                scope = "global"
+                current_func, func_brace_level = val, brace_depth + 1
+            elif nxt == ":":
+                # Parameter:  IDENTIFIER : Type  — belongs to the current func.
+                kind  = "parameter"
+                dtype = nxt2 if nxt2 in datatype_keywords else "—"
+                if current_func:
+                    scope = f"local ({current_func})"
+            elif prev in datatype_keywords:
+                # Variable declaration
+                kind, dtype = "variable", prev
+            else:
+                kind, dtype = "use", None     # a reference/usage
+
+            if val not in symbols:
+                if kind == "function":
+                    info = "function"
+                    addr = None
+                else:
+                    addr = next_addr
+                    next_addr += type_size.get(dtype, 4)
+                    info = f"{kind} @ 0x{addr:04X}"
+                symbols[val] = {
+                    "name":      val,
+                    "data_type": dtype or "—",
+                    "scope":     scope,
+                    "kind":      kind,
+                    "addr":      addr,
+                    "info":      info,
+                    "returns":   None,
+                    "count":     1,
+                }
+                order.append(val)
+            else:
+                e = symbols[val]
+                e["count"] += 1
+                # Backfill data type / kind if it gets declared later.
+                if e["data_type"] == "—" and dtype and dtype != "—":
+                    e["data_type"] = dtype
+                if e["kind"] == "use" and kind != "use":
+                    e["kind"] = kind
+
+        i += 1
+
+    # ── Compose the final "info" string per entry ────────────────────────
+    result = []
+    for name in order:
+        e = symbols[name]
+        bits = [e["info"]]
+        if e.get("returns") is not None:
+            bits.append(f"returns: {e['returns']}")
+        if e["count"] > 1:
+            bits.append(f"refs: {e['count']}")
+        e["info"] = "  |  ".join(b for b in bits if b)
+        result.append(e)
+    return result
