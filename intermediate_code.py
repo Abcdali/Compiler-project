@@ -1,26 +1,10 @@
-# =============================================================================
-# intermediate_code.py  —  Three-Address Code (TAC) generator
-# =============================================================================
-# Phase: Intermediate Code Generation
-#
-# Walks the parse tree (Node) produced by any Crystal parser and emits
-# three-address code.  Every instruction has at most three addresses:
-#
-#       result = arg1  op  arg2
-#
-# Temporaries are named t1, t2, ...   Labels are named L1, L2, ...
-# =============================================================================
-
 from parser_rules import Node
 
-
-# Arithmetic operator token  →  TAC symbol
 BIN_OPS = {
     "plus": "+", "minus": "-", "mul": "*", "div": "/",
     "mode": "%", "power": "**",
 }
 
-# Relational operator token  →  TAC symbol
 REL_OPS = {
     "is_it":   "==", "==":       "==",
     "is_less":  "<",  "is_grtr":  ">",
@@ -29,9 +13,6 @@ REL_OPS = {
 }
 
 
-# ---------------------------------------------------------------------------
-# A single three-address instruction (quadruple form: op, arg1, arg2, result)
-# ---------------------------------------------------------------------------
 class Quad:
     __slots__ = ("op", "arg1", "arg2", "result")
 
@@ -56,7 +37,7 @@ class Quad:
             return f"    return {self.arg1}" if self.arg1 is not None else "    return"
         if op == "func":    return f"\nfunc {self.result}:"
         if op == "endfunc": return f"    end func {self.result}\n"
-        # default: binary instruction  result = arg1 op arg2
+     
         return f"    {self.result} = {self.arg1} {op} {self.arg2}"
 
     def as_row(self):
@@ -68,10 +49,6 @@ class Quad:
             "" if self.result is None else str(self.result),
         )
 
-
-# ---------------------------------------------------------------------------
-# Three-Address Code generator
-# ---------------------------------------------------------------------------
 class TACGenerator:
     """Generate three-address code from a Crystal parse tree."""
 
@@ -80,7 +57,6 @@ class TACGenerator:
         self._t = 0
         self._l = 0
 
-    # ── name factories ──────────────────────────────────────────────────
     def new_temp(self) -> str:
         self._t += 1
         return f"t{self._t}"
@@ -92,7 +68,6 @@ class TACGenerator:
     def emit(self, op, arg1=None, arg2=None, result=None):
         self.quads.append(Quad(op, arg1, arg2, result))
 
-    # ── tree navigation helpers ─────────────────────────────────────────
     def _child(self, node, *names):
         if node is None:
             return None
@@ -117,25 +92,23 @@ class TACGenerator:
     def _leaf_val(node):
         return node.value if node.value is not None else node.name
 
-    # ── entry point ─────────────────────────────────────────────────────
     def generate(self, root: Node):
         self.quads = []
         self._t = 0
         self._l = 0
         prog = root
-        # Unwrap augmented start  Program'  →  Program  (LR parsers)
+     
         if prog is not None and prog.name.endswith("'") and prog.kids:
             prog = prog.kids[0]
         if prog is not None:
             self._program(prog)
         return self.quads
 
-    # ── Program → FuncList StmtList ─────────────────────────────────────
     def _program(self, node):
         self._funclist(self._child(node, "FuncList"))
         self._stmtlist(self._child(node, "StmtList"))
 
-    # ── FuncList → FunctionDef FuncList | ε ─────────────────────────────
+  
     def _funclist(self, node):
         fd = self._child(node, "FunctionDef")
         if fd:
@@ -145,7 +118,7 @@ class TACGenerator:
     def _functiondef(self, node):
         name = self._ident(node)
         self.emit("func", result=name)
-        # Parameters become incoming params.
+       
         for ident in self._collect_param_names(self._child(node, "ParamList")):
             self.emit("param", arg1=ident)
         self._stmtlist(self._child(node, "StmtList"))
@@ -161,7 +134,7 @@ class TACGenerator:
             cur = self._child(cur, "ParamTail")
         return names
 
-    # ── StmtList → Stmt StmtList | ε ────────────────────────────────────
+ 
     def _stmtlist(self, node):
         st = self._child(node, "Stmt")
         if st:
@@ -187,9 +160,9 @@ class TACGenerator:
         if handler:
             handler(c)
 
-    # ── Declarations / Assignments ──────────────────────────────────────
+
     def _decl(self, node):
-        # DataType IDENTIFIER DeclTail   (DeclTail = equalto Expr Semi | Semi)
+    
         name  = self._ident(node)
         dtail = self._child(node, "DeclTail")
         expr  = self._child(dtail, "Expr") if dtail else None
@@ -198,7 +171,7 @@ class TACGenerator:
             self.emit("=", arg1=place, result=name)
 
     def _assign(self, node):
-        # IDENTIFIER equalto Expr Semi
+      
         name  = self._ident(node)
         place = self._expr(self._child(node, "Expr"))
         self.emit("=", arg1=place, result=name)
@@ -210,14 +183,14 @@ class TACGenerator:
     def _input(self, node):
         self.emit("read", arg1=self._ident(node))
 
-    # ── Expressions ─────────────────────────────────────────────────────
+    
     def _expr(self, node):
         place = self._term(self._child(node, "Term"))
         return self._exprtail(self._child(node, "ExprTail"), place)
 
     def _exprtail(self, node, left):
         if node is None or not node.kids:
-            return left                       # ε
+            return left                       
         op    = BIN_OPS.get(node.kids[0].name, node.kids[0].name)
         right = self._term(self._child(node, "Term"))
         t = self.new_temp()
@@ -230,7 +203,7 @@ class TACGenerator:
 
     def _termtail(self, node, left):
         if node is None or not node.kids:
-            return left                       # ε
+            return left                       
         op    = BIN_OPS.get(node.kids[0].name, node.kids[0].name)
         right = self._factor(self._child(node, "Factor"))
         t = self.new_temp()
@@ -238,7 +211,7 @@ class TACGenerator:
         return self._termtail(self._child(node, "TermTail"), t)
 
     def _factor(self, node):
-        # Factor → (( Expr )) | NUMBER | FLOAT | STRING | IDENTIFIER | yes | no
+       
         if node is None or not node.kids:
             return "?"
         first = node.kids[0]
@@ -246,7 +219,6 @@ class TACGenerator:
             return self._expr(self._child(node, "Expr"))
         return self._leaf_val(first)
 
-    # ── Conditions ──────────────────────────────────────────────────────
     def _condition(self, node):
         """Evaluate a condition into a boolean temporary and return it."""
         exprs = self._children(node, "Expr")
@@ -259,7 +231,6 @@ class TACGenerator:
         self.emit(op, arg1=left, arg2=right, result=t)
         return t
 
-    # ── check / elif / uncheck  (if / else-if / else) ──────────────────
     def _check(self, node):
         end = self.new_label()
         cond = self._condition(self._child(node, "Condition"))
@@ -276,7 +247,7 @@ class TACGenerator:
 
     def _eliflist(self, node, end):
         if node is None or not node.kids:
-            return                            # ε
+            return                            
         cond = self._condition(self._child(node, "Condition"))
         nxt  = self.new_label()
         self.emit("ifFalse", arg1=cond, result=nxt)
@@ -285,7 +256,6 @@ class TACGenerator:
         self.emit("label", result=nxt)
         self._eliflist(self._child(node, "ElifList"), end)
 
-    # ── Loops ───────────────────────────────────────────────────────────
     def _while(self, node):
         start, end = self.new_label(), self.new_label()
         self.emit("label", result=start)
@@ -296,7 +266,7 @@ class TACGenerator:
         self.emit("label", result=end)
 
     def _do(self, node):
-        # dloop {{ StmtList }} wloop (( Condition )) Semi
+      
         start = self.new_label()
         self.emit("label", result=start)
         self._stmtlist(self._child(node, "StmtList"))
@@ -304,12 +274,12 @@ class TACGenerator:
         self.emit("if", arg1=cond, result=start)
 
     def _for(self, node):
-        # floop (( ID = Expr ; Condition ; ID = Expr )) {{ StmtList }}
+
         idents = [c for c in node.kids if c.tok_type == "IDENTIFIER"]
         exprs  = self._children(node, "Expr")
         cond   = self._child(node, "Condition")
 
-        if idents and exprs:                  # initialisation
+        if idents and exprs:                
             self.emit("=", arg1=self._expr(exprs[0]),
                       result=self._leaf_val(idents[0]))
 
@@ -318,13 +288,13 @@ class TACGenerator:
         if cond:
             self.emit("ifFalse", arg1=self._condition(cond), result=end)
         self._stmtlist(self._child(node, "StmtList"))
-        if len(idents) > 1 and len(exprs) > 1:  # update
+        if len(idents) > 1 and len(exprs) > 1:  
             self.emit("=", arg1=self._expr(exprs[1]),
                       result=self._leaf_val(idents[1]))
         self.emit("goto", result=start)
         self.emit("label", result=end)
 
-    # ── Return ──────────────────────────────────────────────────────────
+
     def _return(self, node):
         retval = self._child(node, "RetVal")
         expr   = self._child(retval, "Expr") if retval else None
@@ -332,11 +302,6 @@ class TACGenerator:
             self.emit("return", arg1=self._expr(expr))
         else:
             self.emit("return")
-
-
-# ---------------------------------------------------------------------------
-# Convenience module-level helpers
-# ---------------------------------------------------------------------------
 def generate(root: Node):
     """Return a list of Quad instructions for the given parse tree."""
     return TACGenerator().generate(root)
@@ -345,3 +310,57 @@ def generate(root: Node):
 def to_text(quads) -> str:
     """Join a list of Quads into a single TAC listing."""
     return "\n".join(q.to_text() for q in quads)
+
+
+_VALUE_OPS = {"+", "-", "*", "/", "%", "**",
+              "==", "!=", "<", ">", "<=", ">="}
+
+
+def to_triples(quads):
+    """
+    Convert the quadruples into TRIPLES.
+
+    A triple has only (op, arg1, arg2) — NO explicit result field.  A computed
+    value is referred to by the *position* of the triple that produced it,
+    written as (i).  Temporaries t1, t2 … disappear and become these (i)
+    back-references — that is the whole point of the triple representation.
+
+    Returns a list of dicts: {"idx", "op", "arg1", "arg2"}.
+    """
+    triples  = []
+    temp_idx = {}                      
+
+    def ref(a):
+        if a is None:
+            return ""
+        s = str(a)
+        return f"({temp_idx[s]})" if s in temp_idx else s
+
+    for q in quads:
+        op = q.op
+        if op in _VALUE_OPS:
+            idx = len(triples)
+            triples.append({"idx": idx, "op": op,
+                            "arg1": ref(q.arg1), "arg2": ref(q.arg2)})
+            if q.result is not None:
+                temp_idx[str(q.result)] = idx
+        elif op == "=":
+            triples.append({"idx": len(triples), "op": "=",
+                            "arg1": str(q.result), "arg2": ref(q.arg1)})
+        elif op == "ifFalse":
+            triples.append({"idx": len(triples), "op": "ifFalse",
+                            "arg1": ref(q.arg1), "arg2": str(q.result)})
+        elif op == "if":
+            triples.append({"idx": len(triples), "op": "if",
+                            "arg1": ref(q.arg1), "arg2": str(q.result)})
+        elif op in ("goto", "label", "func", "endfunc"):
+            triples.append({"idx": len(triples), "op": op,
+                            "arg1": str(q.result), "arg2": ""})
+        elif op in ("display", "read", "param", "return"):
+            arg = ref(q.arg1) if q.arg1 is not None else ""
+            triples.append({"idx": len(triples), "op": op,
+                            "arg1": arg, "arg2": ""})
+        else:
+            triples.append({"idx": len(triples), "op": op,
+                            "arg1": ref(q.arg1), "arg2": ref(q.arg2)})
+    return triples

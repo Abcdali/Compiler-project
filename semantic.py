@@ -1,17 +1,16 @@
-# =============================================================================
-# semantic.py  —  Syntax-Directed Definitions (SDD) for Crystal Language
-# =============================================================================
-# Phase: Syntax Analysis (Phase 3)
-# Each grammar rule has a semantic action that computes:
-#   node.meaning  — human-readable description of what this construct means
-#   node.stype    — type attribute (for declarations / expressions)
-#   node.sval     — synthesized value (for constants / expressions)
-# =============================================================================
-
 from parser_rules import Node
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+
+_BIN_OPS = {
+    "plus": "+", "minus": "-", "mul": "*", "div": "/",
+    "mode": "%", "power": "**",
+}
+_REL_OPS = {
+    "is_it":   "==", "is_less":  "<",  "is_grtr":  ">",
+    "less=":   "<=", "grtr=":    ">=",
+    "is_less=":"<=", "is_grtr=": ">=",
+}
 
 def _kids_by_name(node: Node, *names):
     """Return children whose .name is in names (best-effort)."""
@@ -36,10 +35,6 @@ def _all_leaf_values(node: Node) -> list[str]:
     return result
 
 
-# =============================================================================
-# SDD Engine — post-order traversal, annotates every node
-# =============================================================================
-
 class SDDEngine:
     """
     Annotates the parse tree produced by any of the Crystal parsers with:
@@ -48,7 +43,6 @@ class SDDEngine:
       - node.sval     (str)  : synthesized value string
     """
 
-    # Map grammar non-terminal names → handler method
     _HANDLERS: dict = {}
 
     def annotate(self, root: Node) -> Node:
@@ -57,30 +51,146 @@ class SDDEngine:
         return root
 
     def _visit(self, node: Node):
-        # Initialise extra attributes
+
         node.meaning = ""
         node.stype   = ""
         node.sval    = node.value or ""
+        node.aval    = None         
 
-        # Recurse first (post-order = synthesised attributes)
         for child in node.kids:
             self._visit(child)
 
-        # Apply the matching SDD rule
         handler = getattr(self, f"_sdd_{node.name}", None)
         if handler:
             handler(node)
         elif node.is_terminal():
             self._sdd_terminal(node)
 
-    # =========================================================================
-    # Terminal leaf — base case
-    # =========================================================================
+        self._compute_value(node)
+
+    def _child_any(self, node: Node, *names):
+        for c in node.kids:
+            if c.name in names:
+                return c
+        return None
+
+    @staticmethod
+    def _fmt(v):
+        """Pretty-print a value (drop trailing .0 on whole floats)."""
+        if isinstance(v, bool):
+            return "yes" if v else "no"
+        if isinstance(v, float) and v.is_integer():
+            return str(int(v))
+        return str(v)
+
+    def _terminal_value(self, node: Node):
+        """Literal value carried by a terminal leaf, or None."""
+        tt, v = node.tok_type, node.value
+        if tt == "NUMBER":
+            try:    return int(v)
+            except (TypeError, ValueError): return v
+        if tt == "FLOAT":
+            try:    return float(v)
+            except (TypeError, ValueError): return v
+        if tt == "STRING":
+            return v               
+        if tt == "IDENTIFIER":
+            return v                   
+        if node.name == "yes":
+            return True
+        if node.name == "no":
+            return False
+        return None                      
+
+    def _apply_op(self, op_tok, left, right):
+        """Fold a binary arithmetic op; stay symbolic if not both numeric."""
+        sym = _BIN_OPS.get(op_tok, op_tok)
+        if isinstance(left, (int, float)) and isinstance(right, (int, float)) \
+                and not isinstance(left, bool) and not isinstance(right, bool):
+            try:
+                if sym == "+":  return left + right
+                if sym == "-":  return left - right
+                if sym == "*":  return left * right
+                if sym == "/":  return left / right if right != 0 else f"({left} / {right})"
+                if sym == "%":  return left % right if right != 0 else f"({left} % {right})"
+                if sym == "**": return left ** right
+            except Exception:
+                pass
+        return f"({self._fmt(left)} {sym} {self._fmt(right)})"
+
+    def _apply_rel(self, op_tok, left, right):
+        """Fold a relational op into yes/no when both sides are numeric."""
+        sym = _REL_OPS.get(op_tok, op_tok)
+        if isinstance(left, (int, float)) and isinstance(right, (int, float)) \
+                and not isinstance(left, bool) and not isinstance(right, bool):
+            try:
+                if sym == "==": return left == right
+                if sym == "<":  return left <  right
+                if sym == ">":  return left >  right
+                if sym == "<=": return left <= right
+                if sym == ">=": return left >= right
+            except Exception:
+                pass
+        return f"({self._fmt(left)} {sym} {self._fmt(right)})"
+
+    def _fold_tail(self, left, tail: Node):
+        """Walk an ExprTail / TermTail chain, folding into `left`."""
+        if tail is None or not tail.kids:
+            return left                                
+        op_tok  = tail.kids[0].name                       
+        operand = self._child_any(tail, "Term", "Factor")
+        right   = operand.aval if operand else None
+        folded  = self._apply_op(op_tok, left, right)
+        nxt     = self._child_any(tail, "ExprTail", "TermTail")
+        return self._fold_tail(folded, nxt)
+
+    def _compute_value(self, node: Node):
+        name = node.name
+
+        if node.is_terminal():
+            node.aval = self._terminal_value(node)
+            return
+
+        if name == "Factor":
+            if node.kids and node.kids[0].name == "((":
+                inner = self._child_any(node, "Expr")
+                node.aval = inner.aval if inner else None
+            elif node.kids:
+                node.aval = node.kids[0].aval
+
+        elif name == "Term":
+            base = self._child_any(node, "Factor")
+            node.aval = self._fold_tail(base.aval if base else None,
+                                        self._child_any(node, "TermTail"))
+
+        elif name == "Expr":
+            base = self._child_any(node, "Term")
+            node.aval = self._fold_tail(base.aval if base else None,
+                                        self._child_any(node, "ExprTail"))
+
+        elif name == "Condition":
+            exprs = _kids_by_name(node, "Expr")
+            relop = self._child_any(node, "RelOp")
+            op    = relop.kids[0].name if (relop and relop.kids) else "?"
+            left  = exprs[0].aval if exprs           else None
+            right = exprs[1].aval if len(exprs) > 1  else None
+            node.aval = self._apply_rel(op, left, right)
+
+        elif name == "DeclTail":
+            inner = self._child_any(node, "Expr")
+            node.aval = inner.aval if inner else None
+
+        elif name in ("DeclStmt", "AssignStmt", "DisplayStmt", "RetVal", "ReturnStmt"):
+            inner = self._child_any(node, "Expr", "DeclTail", "RetVal")
+            node.aval = inner.aval if inner else None
+
+        elif name == "Stmt":
+            node.aval = node.kids[0].aval if node.kids else None
 
     def _sdd_terminal(self, node: Node):
         node.sval    = node.value or node.name
         node.meaning = f"Token: {node.tok_type or node.name} = \"{node.sval}\""
-        # Infer basic type
+    
         if node.tok_type == "NUMBER":
             node.stype = "integer"
         elif node.tok_type == "FLOAT":
@@ -90,12 +200,8 @@ class SDDEngine:
         elif node.tok_type == "IDENTIFIER":
             node.stype = "id"
 
-    # =========================================================================
-    # SDD Rules per Non-Terminal
-    # =========================================================================
 
     def _sdd_Program(self, node: Node):
-        # Program → FuncList StmtList
         func_list = self._child(node, "FuncList")
         stmt_list = self._child(node, "StmtList")
         n_funcs = self._count_funcs(func_list) if func_list else 0
@@ -113,8 +219,8 @@ class SDDEngine:
             node.meaning = "Function definition list"
 
     def _sdd_FunctionDef(self, node: Node):
-        # fun IDENTIFIER (( ParamList )) {{ StmtList }}
-        name = self._leaf_val(node, 1)    # IDENTIFIER is 2nd child
+    
+        name = self._leaf_val(node, 1)   
         node.meaning = f"Function definition: {name}(...)"
         node.stype   = "function"
         node.sval    = name
@@ -128,7 +234,7 @@ class SDDEngine:
             node.sval    = ", ".join(params)
 
     def _sdd_Param(self, node: Node):
-        # IDENTIFIER : Type
+  
         leaves = _all_leaf_values(node)
         if len(leaves) >= 2:
             node.meaning = f"Parameter: {leaves[0]} : {leaves[-1]}"
@@ -136,7 +242,7 @@ class SDDEngine:
             node.sval    = f"{leaves[0]}:{leaves[-1]}"
 
     def _sdd_ParamTail(self, node: Node):
-        # ParamTail → , Param ParamTail | ε   (iterated list)
+    
         if not node.kids:
             node.meaning = "No more parameters"
             node.sval    = ""
@@ -157,16 +263,15 @@ class SDDEngine:
 
     def _sdd_Stmt(self, node: Node):
         if node.kids:
-            # Pass through child meaning
+    
             c = node.kids[0]
             node.meaning = c.meaning
             node.stype   = c.stype
             node.sval    = c.sval
 
-    # ── Declaration ──────────────────────────────────────────────────────────
 
     def _sdd_DeclStmt(self, node: Node):
-        # DataType IDENTIFIER DeclTail
+
         dtype = self._child(node, "DataType")
         ident = self._leaf_at_type(node, "IDENTIFIER")
         dtail = self._child(node, "DeclTail")
@@ -185,7 +290,7 @@ class SDDEngine:
         node.sval  = name_str
 
     def _sdd_DeclTail(self, node: Node):
-        # equalto Expr Semi  OR  Semi
+     
         expr = self._child(node, "Expr")
         if expr:
             node.meaning = f"Initialiser: = {expr.sval}"
@@ -204,10 +309,9 @@ class SDDEngine:
     def _sdd_Type(self, node: Node):
         self._sdd_DataType(node)
 
-    # ── Assignment ───────────────────────────────────────────────────────────
 
     def _sdd_AssignStmt(self, node: Node):
-        # IDENTIFIER equalto Expr Semi
+     
         ident = self._leaf_at_type(node, "IDENTIFIER")
         expr  = self._child(node, "Expr")
         name  = ident.value if ident else "?"
@@ -216,7 +320,7 @@ class SDDEngine:
         node.stype   = expr.stype if expr else ""
         node.sval    = val
 
-    # ── Display / Input ──────────────────────────────────────────────────────
+   
 
     def _sdd_DisplayStmt(self, node: Node):
         expr = self._child(node, "Expr")
@@ -230,7 +334,7 @@ class SDDEngine:
         node.meaning = f"Read input → variable '{name}'"
         node.sval    = name
 
-    # ── Conditionals ─────────────────────────────────────────────────────────
+
 
     def _sdd_CheckStmt(self, node: Node):
         cond = self._child(node, "Condition")
@@ -251,8 +355,6 @@ class SDDEngine:
         else:
             node.meaning = "Else branch"
 
-    # ── Loops ────────────────────────────────────────────────────────────────
-
     def _sdd_WhileLoop(self, node: Node):
         cond = self._child(node, "Condition")
         node.meaning = f"While loop: while ( {cond.sval if cond else '?'} )"
@@ -266,8 +368,6 @@ class SDDEngine:
     def _sdd_DoLoop(self, node: Node):
         cond = self._child(node, "Condition")
         node.meaning = f"Do-while loop: do {{ ... }} while ( {cond.sval if cond else '?'} )"
-
-    # ── Return ───────────────────────────────────────────────────────────────
 
     def _sdd_ReturnStmt(self, node: Node):
         retval = self._child(node, "RetVal")
@@ -284,10 +384,9 @@ class SDDEngine:
             node.sval    = expr.sval if expr else ""
             node.meaning = f"Return value: {node.sval}"
 
-    # ── Condition ────────────────────────────────────────────────────────────
 
     def _sdd_Condition(self, node: Node):
-        # Expr RelOp Expr
+
         exprs  = [c for c in node.kids if c.name == "Expr"]
         relop  = self._child(node, "RelOp")
         left   = exprs[0].sval  if len(exprs) > 0 else "?"
@@ -307,10 +406,9 @@ class SDDEngine:
         node.sval    = RELOP_MEANINGS.get(v, v)
         node.meaning = f"Relational operator: {v} → {node.sval}"
 
-    # ── Expressions ──────────────────────────────────────────────────────────
 
     def _sdd_Expr(self, node: Node):
-        # Term ExprTail
+
         term  = self._child(node, "Term")
         tail  = self._child(node, "ExprTail")
         base  = term.sval  if term else "?"
@@ -345,7 +443,7 @@ class SDDEngine:
         node.meaning = f"Term tail: {node.sval.strip()}"
 
     def _sdd_Factor(self, node: Node):
-        # NUMBER | FLOAT | STRING | IDENTIFIER | yes | no | (( Expr ))
+
         if not node.kids:
             node.sval = ""
             return
@@ -360,9 +458,6 @@ class SDDEngine:
             node.stype   = first.stype or first.tok_type or ""
             node.meaning = f"Factor: {node.sval} [{node.stype}]"
 
-    # =========================================================================
-    # Utility helpers
-    # =========================================================================
 
     def _child(self, node: Node, name: str) -> Node | None:
         for c in node.kids:

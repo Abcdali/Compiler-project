@@ -1,7 +1,3 @@
-# =============================================================================
-# ll1_parser.py  —  LL(1) parser for Crystal language
-# =============================================================================
-
 from parser_rules import GrammarEngine
 
 
@@ -16,8 +12,6 @@ def ll1_parse(tokens):
     engine = GrammarEngine()
     return engine.ll1_parse(tokens)
 
-
-# ── Quick test ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import lexer
     code = 'integer x equalto 5 semi'

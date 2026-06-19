@@ -1,20 +1,12 @@
-# =============================================================================
-# parser_rules.py  —  GrammarEngine  (LR-items, FIRST/FOLLOW, SLR/CLR/LR0)
-# =============================================================================
-
 from grammer import Grammar, GRAMMAR, START, EPS, END
 
-
-# ---------------------------------------------------------------------------
-# Parse-tree / AST node  (used by all parsers)
-# ---------------------------------------------------------------------------
 class Node:
     def __init__(self, name, tok_type=None, value=None, line=None, col=None):
-        self.name     = name       # grammar symbol name (NT) or token value (terminal)
-        self.tok_type = tok_type   # original token type from lexer  (terminals only)
-        self.value    = value      # semantic value (propagated from leaves)
-        self.line     = line       # source line  (terminals only)
-        self.col      = col        # source column (terminals only)
+        self.name     = name      
+        self.tok_type = tok_type  
+        self.value    = value      
+        self.line     = line     
+        self.col      = col        
         self.kids     = []
 
     def add(self, child):
@@ -27,10 +19,6 @@ class Node:
     def __repr__(self):
         return f"Node({self.name!r}, kids={len(self.kids)})"
 
-
-# ---------------------------------------------------------------------------
-# LR Item:  (lhs, rhs_tuple, dot_pos, lookahead_frozenset)
-# ---------------------------------------------------------------------------
 class Item:
     def __init__(self, lhs, rhs, dot=0, lookahead=None):
         self.lhs = lhs
@@ -69,19 +57,8 @@ class Item:
         return f"[{self.lhs} → {' '.join(rhs_str)}{la}]"
 
 
-# ---------------------------------------------------------------------------
-# GrammarEngine
-# ---------------------------------------------------------------------------
 class GrammarEngine:
-    """
-    Wraps Grammar (First/Follow) and builds LR automata.
 
-    Usage:
-        engine = GrammarEngine()              # uses Crystal grammar
-        engine = GrammarEngine(rules, start)  # custom grammar
-    """
-
-    # ── Session-level cache — tables built once, reused on every click ──
     _CACHE: dict = {}
 
     def __init__(self, rules=None, start=None):
@@ -91,16 +68,16 @@ class GrammarEngine:
         self._first  = None
         self._follow = None
 
-        # Augmented start symbol
+      
         self.aug_start = self.start + "'"
-        # Augmented productions list: [(lhs, [rhs...]), ...]
+      
         self._aug_prods = [(self.aug_start, [self.start])]
         for lhs, prods in self.rules.items():
             for prod in prods:
                 rhs = [] if prod == [EPS] else list(prod)
                 self._aug_prods.append((lhs, rhs))
 
-    # ── First / Follow (delegate) ──────────────────────────────────────────
+  
     def first_sets(self):
         if self._first is None:
             self._first = self.g.first_sets()
@@ -123,7 +100,6 @@ class GrammarEngine:
             result.add(EPS)
         return result
 
-    # ── LR item-set construction ──────────────────────────────────────────
     def _closure(self, items, mode="CLR"):
         """Compute closure of an item set."""
         closure = set(items)
@@ -136,16 +112,15 @@ class GrammarEngine:
             for prod in self.rules[B]:
                 rhs = [] if prod == [EPS] else list(prod)
                 if mode == "CLR":
-                    # CLR(1): for each lookahead la, compute FIRST(beta . la)
-                    # beta = symbols after B in the current item
+
                     beta = list(item.rhs[item.dot + 1:])
                     la = set()
                     for a in item.lookahead:
-                        # FIRST(beta followed by terminal a)
+                      
                         la |= self.first_of_seq(beta + [a]) - {EPS}
                     new_item = Item(B, rhs, 0, la)
                 else:
-                    # LR(0) / SLR: no lookahead
+                   
                     new_item = Item(B, rhs, 0)
                 if new_item not in closure:
                     closure.add(new_item)
@@ -172,13 +147,13 @@ class GrammarEngine:
         i0 = self._closure({start_item}, mode)
         states = [i0]
         state_map = {i0: 0}
-        transitions = {}     # (state_idx, symbol) → state_idx
+        transitions = {}    
         queue = [i0]
 
         while queue:
             current = queue.pop(0)
             idx = state_map[current]
-            # Collect all symbols after dots
+      
             symbols = {item.after_dot for item in current if item.after_dot}
             for sym in symbols:
                 goto = self._goto(current, sym, mode)
@@ -192,7 +167,6 @@ class GrammarEngine:
 
         return states, transitions
 
-    # ── Parse-table builders ──────────────────────────────────────────────
     def build_lr0_table(self):
         if "lr0" in GrammarEngine._CACHE:
             return GrammarEngine._CACHE["lr0"]
@@ -218,7 +192,7 @@ class GrammarEngine:
                             conflicts.append(f"LR(0) conflict at state {i} on '{sym}'")
                         ACTION[key] = entry
                 else:
-                    # Reduce on all terminals in FOLLOW
+                  
                     if item.lhs == self.aug_start:
                         ACTION[(i, END)] = ("accept",)
                     else:
@@ -311,7 +285,6 @@ class GrammarEngine:
         GrammarEngine._CACHE["clr"] = (ACTION, GOTO, states, trans, conflicts)
         return ACTION, GOTO, states, trans, conflicts
 
-    # ── LR parse driver (SLR / CLR / LR0) ────────────────────────────────
     def lr_parse(self, tokens, mode="SLR"):
         """
         Parse a list of token-dicts from lexer.
@@ -368,7 +341,7 @@ class GrammarEngine:
                     children.insert(0, stack_nodes.pop())
                 node = Node(lhs)
                 node.kids = children
-                # Propagate: value = concatenated children values
+
                 node.value = " ".join(
                     c.value for c in children if c.value is not None
                 ) or None
@@ -384,13 +357,52 @@ class GrammarEngine:
                 )
                 return root
 
-    # ── LL(1) parse driver ────────────────────────────────────────────────
+    def transition_diagrams(self):
+        """
+        Build a transition diagram for every non-terminal — the top-down
+        equivalent of the LR item-set DFA (Dragon Book §4.4.3).
+
+        For A → X1 X2 ... Xk a path of states is created from the start
+        state to the single final state, with edges labelled X1..Xk.
+        An ε-production gives a direct  start --ε--> final  edge.
+
+        Returns: { NT: {"start": int, "final": int,
+                        "states": [int...], "edges": [(src, sym, dst)...] } }
+        """
+        diagrams = {}
+        for A, prods in self.rules.items():
+            counter = [0]
+            def new_state():
+                counter[0] += 1
+                return counter[0]
+            start = 0
+            final = new_state()
+            states = {start, final}
+            edges  = []
+            for prod in prods:
+                syms = [] if prod == [EPS] else list(prod)
+                cur = start
+                if not syms:
+                    edges.append((cur, EPS, final))
+                    continue
+                for i, sym in enumerate(syms):
+                    nxt = final if i == len(syms) - 1 else new_state()
+                    states.add(nxt)
+                    edges.append((cur, sym, nxt))
+                    cur = nxt
+            diagrams[A] = {
+                "start": start, "final": final,
+                "states": sorted(states), "edges": edges,
+            }
+        return diagrams
+
+
     def build_ll1_table(self):
         if "ll1" in GrammarEngine._CACHE:
             return GrammarEngine._CACHE["ll1"]
         first  = self.first_sets()
         follow = self.follow_sets()
-        table  = {}   # (NT, terminal) → production list
+        table  = {}  
 
         for nt, prods in self.rules.items():
             for prod in prods:
@@ -399,7 +411,7 @@ class GrammarEngine:
                     if t != EPS:
                         key = (nt, t)
                         if key in table:
-                            pass  # LL(1) conflict
+                            pass
                         table[key] = prod
                 if EPS in f:
                     for t in follow.get(nt, set()):
@@ -428,7 +440,7 @@ class GrammarEngine:
 
             if sym == END:
                 if look == END:
-                    # propagate values bottom-up
+                    
                     self._propagate(root)
                     return root
                 tok = tokens[i] if i < len(tokens) else {}
@@ -440,7 +452,7 @@ class GrammarEngine:
                 )
 
             if sym not in self.rules:
-                # Terminal
+          
                 if sym == look:
                     tok = tokens[i] if i < len(tokens) else {}
                     node.name     = tok.get("value", END)
@@ -461,7 +473,7 @@ class GrammarEngine:
                         ln, col
                     )
             else:
-                # Non-terminal
+              
                 prod = table.get((sym, look))
                 if prod is None:
                     tok = tokens[i] if i < len(tokens) else {}
@@ -489,12 +501,11 @@ class GrammarEngine:
         for child in node.kids:
             self._propagate(child)
         if not node.kids:
-            return   # terminal — value already set during shift/match
+            return   
         node.value = " ".join(
             c.value for c in node.kids if c.value is not None
         ) or None
 
-    # ── Helpers ───────────────────────────────────────────────────────────
     def _prod_index(self, lhs, rhs):
         """Return 0-based index of (lhs, rhs) in augmented productions."""
         for idx, (l, r) in enumerate(self._aug_prods):

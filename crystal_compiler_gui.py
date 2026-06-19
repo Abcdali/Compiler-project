@@ -1,9 +1,3 @@
-"""
-crystal_compiler_gui.py  —  Crystal Compiler  (PyQt6)
-Buttons: Compile | Tokens | LR(0) Parse | SLR(1) | CLR(1) | LL(1) |
-         FIRST | FOLLOW | Parse Tree | Open | Save
-"""
-
 import sys
 from collections import Counter
 
@@ -13,20 +7,19 @@ from PyQt6.QtWidgets import (
     QPushButton, QTextEdit, QLabel,
     QStatusBar, QFileDialog, QMessageBox,
     QTableWidget, QTableWidgetItem,
-    QTabWidget, QHeaderView,
+    QTabWidget, QHeaderView, QStackedWidget,
+    QGraphicsView, QGraphicsScene, QMenu,
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QTextCursor, QTextCharFormat
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QRectF, QPointF
+from PyQt6.QtGui import (QColor, QFont, QTextCursor, QTextCharFormat,
+                         QShortcut, QKeySequence, QPen, QBrush, QPainter,
+                         QPainterPath)
 
 import lexer as lexer_mod
 from grammer import Grammar, GRAMMAR, START, EPS, END
 from parser_rules import GrammarEngine, Node
 from semantic import SDDEngine
 
-
-# =============================================================================
-# Background worker — builds LR/LL tables off the main thread
-# =============================================================================
 class ParserWorker(QThread):
     """
     Runs table construction + parsing in a background thread.
@@ -39,7 +32,7 @@ class ParserWorker(QThread):
 
     def __init__(self, mode: str, tokens: list, parent=None, inputs=None):
         super().__init__(parent)
-        self.mode   = mode    # "LR0" | "SLR" | "CLR" | "LL1" | "SYNTAX" | "ICG" | "OPT" | "ASM"
+        self.mode   = mode    
         self.tokens = tokens
         self.inputs = inputs or []
 
@@ -91,8 +84,19 @@ class ParserWorker(QThread):
                 except ValueError as pe:
                     result["parse_error"] = pe
 
+            elif self.mode == "ANNOT":
+              
+                engine.build_ll1_table()
+                try:
+                    tree = engine.ll1_parse(self.tokens)
+                    SDDEngine().annotate(tree)
+                    result["tree"]  = tree
+                    result["annot"] = True
+                except ValueError as pe:
+                    result["parse_error"] = pe
+
             elif self.mode == "ICG":
-                # Intermediate Code Generation — parse, then emit three-address code
+              
                 engine.build_ll1_table()
                 try:
                     tree = engine.ll1_parse(self.tokens)
@@ -102,8 +106,34 @@ class ParserWorker(QThread):
                 except ValueError as pe:
                     result["parse_error"] = pe
 
+            elif self.mode == "DAG":
+             
+                engine.build_ll1_table()
+                try:
+                    tree = engine.ll1_parse(self.tokens)
+                    result["tree"] = tree
+                    import intermediate_code as icg
+                    import dag
+                    quads = icg.generate(tree)
+                    result["tac"]        = quads
+                    result["dag_blocks"] = dag.build_dags(quads)
+                except ValueError as pe:
+                    result["parse_error"] = pe
+
+            elif self.mode == "BACKPATCH":
+               
+                engine.build_ll1_table()
+                try:
+                    tree = engine.ll1_parse(self.tokens)
+                    result["tree"] = tree
+                    import backpatching as bp
+                    g = bp.generate(tree)
+                    result["bp"] = (g.instrs, g.log)
+                except ValueError as pe:
+                    result["parse_error"] = pe
+
             elif self.mode == "OPT":
-                # Code Optimization — parse → TAC → optimize
+                
                 engine.build_ll1_table()
                 try:
                     tree = engine.ll1_parse(self.tokens)
@@ -117,7 +147,7 @@ class ParserWorker(QThread):
                     result["parse_error"] = pe
 
             elif self.mode == "ASM":
-                # Target Code Generation — parse → TAC → optimize → assembly
+              
                 engine.build_ll1_table()
                 try:
                     tree = engine.ll1_parse(self.tokens)
@@ -126,14 +156,16 @@ class ParserWorker(QThread):
                     import code_optimization as opt
                     import code_generation as cg
                     quads = icg.generate(tree)
-                    quads = opt.optimize(quads)["optimized"]   # generate from optimized TAC
+                    quads = opt.optimize(quads)["optimized"]   
                     gen = cg.generate(quads)
+                    new_code, _peep = cg.peephole(gen.code)
+                    gen.code = new_code
                     result["asm_text"] = gen.to_text()
                 except ValueError as pe:
                     result["parse_error"] = pe
 
             elif self.mode == "_PREWARM":
-                # Build and cache all tables silently at startup
+             
                 engine.build_ll1_table()
                 engine.build_lr0_table()
                 engine.build_slr_table()
@@ -145,7 +177,6 @@ class ParserWorker(QThread):
         except Exception as e:
             self.error.emit(self.mode, e)
 
-# ── Category colours ──────────────────────────────────────────────────────────
 CATEGORY_COLORS = {
     "KEYWORD":    ("#22d3ee", "#0e3a45"),
     "OPERATOR":   ("#f87171", "#450a0a"),
@@ -164,30 +195,292 @@ TEXT      = "#e6edf3"
 MUTED     = "#8b949e"
 ACCENT    = "#58a6ff"
 
+class TreeGraphView(QGraphicsView):
+    """A pannable / zoomable canvas that draws the parse tree as a real graph."""
 
-# =============================================================================
+    C_NONTERM = ("#1e3a5f", "#58a6ff", "#dbeafe") 
+    C_TOKEN   = ("#14532d", "#4ade80", "#dcfce7")   
+    C_VALUE   = ("#422006", "#facc15", "#fef9c3")  
+    C_EPSILON = ("#3f3f46", "#a1a1aa", "#e4e4e7")   
+    C_EDGE    = "#475569"
+
+    H_GAP = 26        
+    V_GAP = 84          
+    NODE_H = 34
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._scene = QGraphicsScene(self)
+        self.setScene(self._scene)
+        self.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        self.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+        self.setBackgroundBrush(QBrush(QColor("#0d1117")))
+        self.setStyleSheet(f"border:1px solid {BORDER}; border-radius:8px;")
+        self._leaf_x = 0.0
+
+    def wheelEvent(self, event):
+        factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
+        self.scale(factor, factor)
+
+  
+    def render_tree(self, root, annotated=False):
+        """annotated=True → SDD mode: each node also shows its value (node.aval)."""
+        self._scene.clear()
+        if root is None:
+            return
+        self._annotated = annotated
+        self.node_h = 50 if annotated else self.NODE_H
+        self._vgap  = 104 if annotated else self.V_GAP
+        self._leaf_x = 0.0
+        self._measure(root)                       
+        self._draw_edges(root)
+        self._draw_nodes(root)
+        rect = self._scene.itemsBoundingRect()
+        rect.adjust(-40, -40, 40, 40)
+        self._scene.setSceneRect(rect)
+        self.resetTransform()
+        self.fitInView(rect, Qt.AspectRatioMode.KeepAspectRatio)
+
+   
+    def _top_text(self, node):
+        return str(node.name)                    
+
+    def _val_text(self, node):
+        """Bottom line for annotated mode: the synthesised value (node.aval)."""
+        if not getattr(self, "_annotated", False):
+            return ""
+        av = getattr(node, "aval", None)
+        if av is None or av == "":
+            return ""
+        s = str(av)
+        return "= " + (s if len(s) <= 18 else s[:16] + "…")
+
+    def _label_width(self, node):
+        longest = max(len(self._top_text(node)), len(self._val_text(node)))
+        return max(48, 13 + longest * 8.2)
+
+    def _measure(self, node, depth=0):
+        node._gy = depth * self._vgap
+        if not node.kids:
+            w = self._label_width(node)
+            node._gx = self._leaf_x + w / 2
+            self._leaf_x += w + self.H_GAP
+        else:
+            for k in node.kids:
+                self._measure(k, depth + 1)
+            node._gx = (node.kids[0]._gx + node.kids[-1]._gx) / 2
+
+    def _draw_edges(self, node):
+        pen = QPen(QColor(self.C_EDGE))
+        pen.setWidthF(1.6)
+        for k in node.kids:
+            path = QPainterPath()
+            x1, y1 = node._gx, node._gy + self.node_h / 2
+            x2, y2 = k._gx, k._gy - self.node_h / 2
+            path.moveTo(x1, y1)
+            midy = (y1 + y2) / 2
+            path.cubicTo(x1, midy, x2, midy, x2, y2)   
+            self._scene.addPath(path, pen)
+            self._draw_edges(k)
+
+    def _node_colors(self, node):
+        if node.kids:
+            return self.C_NONTERM
+        if getattr(node, "tok_type", None):
+            return self.C_TOKEN
+        return self.C_EPSILON
+
+    def _draw_nodes(self, node):
+        top = self._top_text(node)
+        val = self._val_text(node)
+        w = self._label_width(node)
+        h = self.node_h
+        x = node._gx - w / 2
+        y = node._gy - h / 2
+        fill, border, txt = self._node_colors(node)
+
+        rect = QRectF(x, y, w, h)
+        box = QPainterPath()
+        box.addRoundedRect(rect, 8, 8)
+        self._scene.addPath(box, QPen(QColor(border), 2), QBrush(QColor(fill)))
+
+        # top line — node name / lexeme
+        item = self._scene.addText(top, QFont("Consolas", 10, QFont.Weight.Bold))
+        item.setDefaultTextColor(QColor(txt))
+        br = item.boundingRect()
+        top_y = (node._gy - br.height() / 2) if not val else (node._gy - br.height() + 2)
+        item.setPos(node._gx - br.width() / 2, top_y)
+
+      
+        if val:
+            vitem = self._scene.addText(val, QFont("Consolas", 9, QFont.Weight.Bold))
+            vitem.setDefaultTextColor(QColor("#fde68a"))
+            vb = vitem.boundingRect()
+            vitem.setPos(node._gx - vb.width() / 2, node._gy + 1)
+
+        
+        if (not self._annotated) and (not node.kids) and getattr(node, "tok_type", None):
+            cap = self._scene.addText(str(node.tok_type), QFont("Consolas", 7))
+            cap.setDefaultTextColor(QColor("#86efac"))
+            cb = cap.boundingRect()
+            cap.setPos(node._gx - cb.width() / 2, node._gy + h / 2 - 1)
+
+        for k in node.kids:
+            self._draw_nodes(k)
+
+
+class DagGraphView(QGraphicsView):
+    C_LEAF = ("#14532d", "#4ade80", "#dcfce7")  
+    C_OP   = ("#3b1d5e", "#c084fc", "#f3e8ff")  
+    C_EDGE = "#64748b"
+    XGAP   = 96
+    YGAP   = 100
+    NODE_W = 64
+    NODE_H = 42
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._scene = QGraphicsScene(self)
+        self.setScene(self._scene)
+        self.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        self.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+        self.setBackgroundBrush(QBrush(QColor("#0d1117")))
+        self.setStyleSheet(f"border:1px solid {BORDER}; border-radius:8px;")
+
+    def wheelEvent(self, event):
+        factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
+        self.scale(factor, factor)
+
+    def render_dags(self, dags):
+        self._scene.clear()
+        if not dags:
+            t = self._scene.addText("No computations to build a DAG from.",
+                                    QFont("Consolas", 11))
+            t.setDefaultTextColor(QColor("#6b7280"))
+            return
+        y = 0.0
+        for dag in dags:
+            y += self._layout_block(dag, y) + 56
+        rect = self._scene.itemsBoundingRect()
+        rect.adjust(-40, -40, 40, 40)
+        self._scene.setSceneRect(rect)
+        self.resetTransform()
+        self.fitInView(rect, Qt.AspectRatioMode.KeepAspectRatio)
+
+    def _layout_block(self, dag, y0):
+        nodes = dag.nodes
+        if not nodes:
+            return 0
+
+       
+        level = {}
+        def lvl(n):
+            if n.nid in level:
+                return level[n.nid]
+            level[n.nid] = 0 if n.is_leaf() else 1 + max(lvl(n.left), lvl(n.right))
+            return level[n.nid]
+        for n in nodes:
+            lvl(n)
+        maxlvl = max(level.values())
+
+        by_level = {}
+        for n in nodes:
+            by_level.setdefault(level[n.nid], []).append(n)
+
+      
+        x = {}
+        for i, n in enumerate(by_level.get(0, [])):
+            x[n.nid] = i * self.XGAP
+        for L in range(1, maxlvl + 1):
+            for n in by_level.get(L, []):
+                x[n.nid] = (x[n.left.nid] + x[n.right.nid]) / 2
+            row = sorted(by_level.get(L, []), key=lambda n: x[n.nid])
+            for j in range(1, len(row)):
+                if x[row[j].nid] < x[row[j - 1].nid] + self.XGAP:
+                    x[row[j].nid] = x[row[j - 1].nid] + self.XGAP
+
+        header_h = 50        
+        for n in nodes:
+            n._dx = x[n.nid]
+            n._dy = y0 + header_h + (maxlvl - level[n.nid]) * self.YGAP
+
+     
+        hdr = self._scene.addText(f"Basic Block  B{dag.block_index}",
+                                  QFont("Consolas", 10, QFont.Weight.Bold))
+        hdr.setDefaultTextColor(QColor("#facc15"))
+        hdr.setPos(min(x.values()) - 28, y0)
+
+   
+        pen = QPen(QColor(self.C_EDGE)); pen.setWidthF(1.7)
+        for n in nodes:
+            if n.is_leaf():
+                continue
+            for child in (n.left, n.right):
+                path = QPainterPath()
+                x1, y1 = n._dx, n._dy + self.NODE_H / 2
+                x2, y2 = child._dx, child._dy - self.NODE_H / 2
+                path.moveTo(x1, y1)
+                midy = (y1 + y2) / 2
+                path.cubicTo(x1, midy, x2, midy, x2, y2)
+                self._scene.addPath(path, pen)
+        for n in nodes:
+            self._draw_node(n)
+
+        return header_h + (maxlvl + 1) * self.YGAP
+
+    def _draw_node(self, n):
+        leaf = n.is_leaf()
+        fill, border, txt = self.C_LEAF if leaf else self.C_OP
+        label = str(n.value) if leaf else str(n.op)
+
+        w = max(self.NODE_W, 16 + len(label) * 10)
+        h = self.NODE_H
+        rect = QRectF(n._dx - w / 2, n._dy - h / 2, w, h)
+        box = QPainterPath(); box.addRoundedRect(rect, 9, 9)
+        self._scene.addPath(box, QPen(QColor(border), 2), QBrush(QColor(fill)))
+
+        item = self._scene.addText(label, QFont("Consolas", 12, QFont.Weight.Bold))
+        item.setDefaultTextColor(QColor(txt))
+        br = item.boundingRect()
+        item.setPos(n._dx - br.width() / 2, n._dy - br.height() / 2)
+
+        
+        cap = self._scene.addText(str(n.nid), QFont("Consolas", 8, QFont.Weight.Bold))
+        cap.setDefaultTextColor(QColor("#7dd3fc"))
+        cb = cap.boundingRect()
+        cap.setPos(n._dx - cb.width() / 2, n._dy - h / 2 - cb.height() + 2)
+
+       
+        if n.labels:
+            tag = self._scene.addText("← " + ", ".join(n.labels),
+                                      QFont("Consolas", 8, QFont.Weight.Bold))
+            tag.setDefaultTextColor(QColor("#fb923c"))
+            tb = tag.boundingRect()
+            tag.setPos(n._dx + w / 2 + 4, n._dy - tb.height() / 2)
+
+
+
 class CrystalCompilerGUI(QMainWindow):
-# =============================================================================
+
 
     def __init__(self):
         super().__init__()
         self._last_tree_root = None
-        self._worker = None          # active background worker
+        self._worker = None        
         self._loading_dots = 0
         self.setWindowTitle("💎 Crystal Compiler")
         self.resize(1500, 860)
         self._apply_stylesheet()
         self._build_ui()
         self._connect_events()
+        self._select_phase(0)        
         self.status.showMessage("Ready • Crystal Compiler Initialized")
-        # Pre-warm all parser tables in background so first button click is instant
+    
         self._prewarm_worker = ParserWorker("_PREWARM", [], parent=self)
         self._prewarm_worker.done.connect(self._on_prewarm_done)
         self._prewarm_worker.start()
-
-    # =========================================================================
-    # STYLESHEET
-    # =========================================================================
 
     def _apply_stylesheet(self):
         self.setStyleSheet(f"""
@@ -227,10 +520,6 @@ class CrystalCompilerGUI(QMainWindow):
         QScrollBar::handle:horizontal {{ background:{BORDER}; border-radius:4px; }}
         """)
 
-    # =========================================================================
-    # UI CONSTRUCTION
-    # =========================================================================
-
     def _build_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
@@ -238,7 +527,6 @@ class CrystalCompilerGUI(QMainWindow):
         root_layout.setContentsMargins(10, 6, 10, 6)
         root_layout.setSpacing(6)
 
-        # Title bar
         title = QLabel("💎 Crystal Compiler")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title.setStyleSheet(f"font-size:26px;font-weight:bold;color:{ACCENT};padding:4px;")
@@ -249,10 +537,8 @@ class CrystalCompilerGUI(QMainWindow):
         subtitle.setStyleSheet(f"color:{MUTED};font-size:11px;margin-bottom:4px;")
         root_layout.addWidget(subtitle)
 
-        # Toolbar
         root_layout.addLayout(self._build_toolbar())
 
-        # Main horizontal splitter: editor | right panel
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setHandleWidth(4)
         splitter.addWidget(self._build_editor_panel())
@@ -262,54 +548,123 @@ class CrystalCompilerGUI(QMainWindow):
         splitter.setSizes([480, 900])
         root_layout.addWidget(splitter, 1)
 
-        # Status bar
         self.status = QStatusBar()
         self.status.setStyleSheet(f"background-color:{PANEL_BG};color:{MUTED};")
         self.setStatusBar(self.status)
 
-    # -------------------------------------------------------------------------
     def _build_toolbar(self):
-        tb = QHBoxLayout()
-        tb.setSpacing(6)
+        """Two-row phased toolbar:  Row 1 = the 6 compiler phases,
+        Row 2 = the actions belonging to the currently selected phase."""
 
         def btn(label, color):
             b = QPushButton(label)
             b.setStyleSheet(f"background-color:{color};")
             return b
 
-       
-        self.tokens_btn  = btn("🧾 Tokens",       "#1f6feb")
-        self.semantics_btn  = btn("🔍 Semantics",       "#7e22ce")
-        self.lr0_btn     = btn("LR(0) Parse",     "#7c3aed")
-        self.slr1_btn    = btn("SLR(1)",           "#2563eb")
-        self.clr1_btn    = btn("CLR(1)",           "#0891b2")
-        self.ll1_btn     = btn("LL(1)",            "#059669")
-        self.first_btn   = btn("FIRST",            "#ea580c")
-        self.follow_btn  = btn("FOLLOW",           "#dc2626")
-        self.tree_btn    = btn("🌳 Parse Tree",    "#db6d28")
-        self.open_btn    = btn("📂 Open",          "#30363d")
-        self.save_btn    = btn("💾 Save",          "#30363d")
-        self.compile_btn = btn("⚙ Intermediate Code Generator", "#238636")
-        self.opt_btn     = btn("🚀 Code Optimization", "#be123c")
-        self.asm_btn     = btn("🖥 Assembly Code", "#0f766e")
+        self.tokens_btn   = btn(" Tokens",            "#1f6feb")
+        self.symtab_btn   = btn(" Symbol Table",      "#0e7490")
+        self.errors_btn   = btn(" Errors",             "#b91c1c")
 
-        for b in (self.tokens_btn, self.semantics_btn,
-                  self.lr0_btn, self.slr1_btn, self.clr1_btn, self.ll1_btn,
-                  self.first_btn, self.follow_btn, self.tree_btn,
-                  self.compile_btn, self.opt_btn, self.asm_btn):
-            tb.addWidget(b)
-        tb.addStretch()
-        tb.addWidget(self.open_btn)
-        tb.addWidget(self.save_btn)
-        return tb
+        self.lr0_btn      = btn("LR(0)",                "#7c3aed")
+        self.slr1_btn     = btn("SLR(1)",               "#2563eb")
+        self.clr1_btn     = btn("CLR(1)",               "#0891b2")
+        self.ll1_btn      = btn("LL(1)",                "#059669")
+        self.first_btn    = btn("FIRST",                "#ea580c")
+        self.follow_btn   = btn("FOLLOW",               "#dc2626")
+        self.tree_btn     = btn(" Parse Tree",        "#db6d28")
 
-    # -------------------------------------------------------------------------
+        self.semantics_btn = btn(" SDD",              "#7e22ce")
+        self.annot_btn     = btn(" Annotated Tree",   "#9333ea")
+
+        self.compile_btn  = btn("Three-Address Code", "#238636")
+        self.dag_btn      = btn(" DAG",               "#0d9488")
+        self.backpatch_btn = btn(" Backpatching",     "#65a30d")
+
+        self.opt_btn      = btn(" Optimize (machine-independent)", "#be123c")
+
+        self.asm_btn      = btn(" Assembly + Peephole", "#0f766e")
+
+        self._phases = [
+            ("1 · Lexical",      "#1f6feb",
+                [self.tokens_btn, self.symtab_btn, self.errors_btn]),
+            ("2 · Syntax",       "#2563eb",
+                [self.lr0_btn, self.slr1_btn, self.clr1_btn, self.ll1_btn,
+                 self.first_btn, self.follow_btn, self.tree_btn]),
+            ("3 · Semantic",     "#7e22ce",
+                [self.semantics_btn, self.annot_btn]),
+            ("4 · Intermediate", "#238636",
+                [self.compile_btn, self.dag_btn, self.backpatch_btn]),
+            ("5 · Optimization", "#be123c",
+                [self.opt_btn]),
+            ("6 · Code Gen",     "#0f766e",
+                [self.asm_btn]),
+        ]
+
+        self._phase_buttons = []
+        phase_row = QHBoxLayout()
+        phase_row.setSpacing(6)
+        for i, (label, color, _actions) in enumerate(self._phases):
+            pb = QPushButton(label)
+            pb.setCheckable(True)
+            pb.setStyleSheet(self._phase_style(color, active=False))
+            pb._color = color
+            pb.clicked.connect(lambda _checked, idx=i: self._select_phase(idx))
+            phase_row.addWidget(pb)
+            self._phase_buttons.append(pb)
+        phase_row.addStretch()
+
+        self.examples_btn = QPushButton("📋 Code Examples")
+        self.examples_btn.setStyleSheet(
+            "background-color:#a16207;color:white;border-radius:8px;"
+            "padding:8px 16px;font-size:13px;font-weight:bold;"
+        )
+        self.examples_btn.clicked.connect(self._show_examples_menu)
+        phase_row.addWidget(self.examples_btn)
+
+        self._sub_row = QHBoxLayout()
+        self._sub_row.setSpacing(6)
+        self._sub_row.addStretch()
+
+        outer = QVBoxLayout()
+        outer.setSpacing(5)
+        outer.addLayout(phase_row)
+        outer.addLayout(self._sub_row)
+        return outer
+
+    def _phase_style(self, color, active):
+        if active:
+            return (f"background-color:{color};color:white;border-radius:8px;"
+                    f"padding:8px 16px;font-size:13px;font-weight:bold;"
+                    f"border:2px solid white;")
+        return (f"background-color:{color};color:#e6edf3;border-radius:8px;"
+                f"padding:8px 16px;font-size:13px;font-weight:bold;opacity:0.85;")
+
+    def _select_phase(self, index):
+        """Show the action buttons belonging to the selected phase in row 2."""
+
+        for i, pb in enumerate(self._phase_buttons):
+            pb.setChecked(i == index)
+            pb.setStyleSheet(self._phase_style(pb._color, active=(i == index)))
+
+
+        while self._sub_row.count():
+            item = self._sub_row.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+
+        for b in self._phases[index][2]:
+            b.setParent(None)
+            b.show()
+            self._sub_row.addWidget(b)
+        self._sub_row.addStretch()
+
     def _build_editor_panel(self):
         widget = QWidget()
         layout = QVBoxLayout(widget)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        lbl = QLabel("📝 Crystal Source Code")
+        lbl = QLabel(" Crystal Source Code")
         lbl.setStyleSheet(f"font-size:13px;font-weight:bold;color:{ACCENT};padding-bottom:4px;")
         layout.addWidget(lbl)
 
@@ -322,23 +677,22 @@ class CrystalCompilerGUI(QMainWindow):
         layout.addWidget(self.editor)
         return widget
 
-    # -------------------------------------------------------------------------
     def _build_right_panel(self):
         widget = QWidget()
         layout = QVBoxLayout(widget)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # Tab widget: Tokens | Parse Table | Parse Tree
+   
         self.tabs = QTabWidget()
         self.tabs.setDocumentMode(True)
 
-        # ── Tab 0: Tokens ──────────────────────────────────────────────────
+    
         tok_tab = QWidget()
         tok_layout = QVBoxLayout(tok_tab)
         tok_layout.setContentsMargins(6, 6, 6, 6)
 
-        # Summary badges row
+        
         self.summary_frame = QWidget()
         self.summary_frame.setStyleSheet(f"QWidget{{background-color:{DARK_BG};}}")
         self.summary_layout = QHBoxLayout(self.summary_frame)
@@ -349,9 +703,8 @@ class CrystalCompilerGUI(QMainWindow):
 
         self.token_table = self._make_table(["Category", "Type", "Value"])
         tok_layout.addWidget(self.token_table)
-        self.tabs.addTab(tok_tab, "🧾 Tokens")
+        self.tabs.addTab(tok_tab, " Tokens")
 
-        # ── Tab 1: Parse Table ─────────────────────────────────────────────
         ptab_tab = QWidget()
         ptab_layout = QVBoxLayout(ptab_tab)
         ptab_layout.setContentsMargins(6, 6, 6, 6)
@@ -376,7 +729,6 @@ class CrystalCompilerGUI(QMainWindow):
             QHeaderView.ResizeMode.ResizeToContents
         )
 
-        # ── Parse table (top) + DFA (bottom) inside a vertical splitter ────
         pt_split = QSplitter(Qt.Orientation.Vertical)
         pt_split.setHandleWidth(4)
         pt_split.addWidget(self.parse_table_widget)
@@ -386,7 +738,7 @@ class CrystalCompilerGUI(QMainWindow):
         dfa_box.setContentsMargins(0, 6, 0, 0)
         dfa_box.setSpacing(2)
 
-        self.dfa_label = QLabel("🔵 DFA — Canonical Collection of LR Items")
+        self.dfa_label = QLabel(" DFA — Canonical Collection of LR Items")
         self.dfa_label.setStyleSheet(
             f"font-size:13px;font-weight:bold;color:#22d3ee;padding-bottom:2px;"
         )
@@ -417,18 +769,27 @@ class CrystalCompilerGUI(QMainWindow):
         pt_split.setStretchFactor(1, 2)
         pt_split.setSizes([420, 320])
         ptab_layout.addWidget(pt_split, 1)
-        self.tabs.addTab(ptab_tab, "📊 Parse Table")
+        self.tabs.addTab(ptab_tab, "Parse Table")
 
-        # ── Tab 2: Parse Tree ──────────────────────────────────────────────
+   
         tree_tab = QWidget()
         tree_layout = QVBoxLayout(tree_tab)
         tree_layout.setContentsMargins(6, 6, 6, 6)
 
-        tree_lbl = QLabel("🌳 Derivation (Parse) Tree")
+        tree_lbl = QLabel(" Derivation (Parse) Tree — graphical")
         tree_lbl.setStyleSheet(
             f"font-size:13px;font-weight:bold;color:{ACCENT};padding-bottom:4px;"
         )
         tree_layout.addWidget(tree_lbl)
+
+        hint = QLabel("scroll = zoom  •  drag = pan")
+        hint.setStyleSheet(f"color:{MUTED};font-size:10px;padding-bottom:2px;")
+        tree_layout.addWidget(hint)
+
+        self.tree_stack = QStackedWidget()
+
+        self.tree_graph = TreeGraphView()
+        self.tree_stack.addWidget(self.tree_graph)      
 
         self.tree_view = QTextEdit()
         self.tree_view.setReadOnly(True)
@@ -448,15 +809,17 @@ class CrystalCompilerGUI(QMainWindow):
             QScrollBar:horizontal {{ background:#161b22; height:8px; border-radius:4px; }}
             QScrollBar::handle:horizontal {{ background:#30363d; border-radius:4px; }}
         """)
-        tree_layout.addWidget(self.tree_view)
-        self.tabs.addTab(tree_tab, "🌳 Parse Tree")
+        self.tree_stack.addWidget(self.tree_view)       
 
-        # ── Tab 3: Syntax Analysis (SDD + Annotated AST) ──────────────────
+        tree_layout.addWidget(self.tree_stack)
+        self.tabs.addTab(tree_tab, " Parse Tree")
+
+      
         syn_tab = QWidget()
         syn_layout = QVBoxLayout(syn_tab)
         syn_layout.setContentsMargins(6, 6, 6, 6)
 
-        syn_lbl = QLabel("🔍 Semantics Analysis — SDD Annotated AST")
+        syn_lbl = QLabel(" Semantics Analysis — SDD Annotated AST")
         syn_lbl.setStyleSheet(
             f"font-size:13px;font-weight:bold;color:#c084fc;padding-bottom:4px;"
         )
@@ -481,14 +844,31 @@ class CrystalCompilerGUI(QMainWindow):
             QScrollBar::handle:horizontal {{ background:#30363d; border-radius:4px; }}
         """)
         syn_layout.addWidget(self.syntax_view)
-        self.tabs.addTab(syn_tab, "🔍 Semantics")
+        self.tabs.addTab(syn_tab, " Semantics")
 
-        # ── Tab 4: Symbol Table ────────────────────────────────────────────
+        self.annot_tab = QWidget()
+        annot_layout = QVBoxLayout(self.annot_tab)
+        annot_layout.setContentsMargins(6, 6, 6, 6)
+
+        self.annot_label = QLabel(" Semantic Annotated Parse Tree — graphical, with VALUES")
+        self.annot_label.setStyleSheet(
+            "font-size:13px;font-weight:bold;color:#c084fc;padding-bottom:4px;"
+        )
+        annot_layout.addWidget(self.annot_label)
+
+        ahint = QLabel("each node shows its synthesised value (= …)  •  scroll = zoom  •  drag = pan")
+        ahint.setStyleSheet(f"color:{MUTED};font-size:10px;padding-bottom:2px;")
+        annot_layout.addWidget(ahint)
+
+        self.annot_graph = TreeGraphView()
+        annot_layout.addWidget(self.annot_graph)
+        self.tabs.addTab(self.annot_tab, " Annotated Tree")
+
         sym_tab = QWidget()
         sym_layout = QVBoxLayout(sym_tab)
         sym_layout.setContentsMargins(6, 6, 6, 6)
 
-        sym_lbl = QLabel("🔣 Symbol Table — Identifiers")
+        sym_lbl = QLabel(" Symbol Table — Identifiers")
         sym_lbl.setStyleSheet(
             f"font-size:13px;font-weight:bold;color:{ACCENT};padding-bottom:4px;"
         )
@@ -498,9 +878,8 @@ class CrystalCompilerGUI(QMainWindow):
             ["Name", "Data Type", "Scope", "Additional Info"]
         )
         sym_layout.addWidget(self.symbol_table)
-        self.tabs.addTab(sym_tab, "🔣 Symbol Table")
+        self.tabs.addTab(sym_tab, " Symbol Table")
 
-        # ── Tab 5: Lexical Errors ──────────────────────────────────────────
         err_tab = QWidget()
         err_layout = QVBoxLayout(err_tab)
         err_layout.setContentsMargins(6, 6, 6, 6)
@@ -517,7 +896,6 @@ class CrystalCompilerGUI(QMainWindow):
         err_layout.addWidget(self.error_table)
         self.tabs.addTab(err_tab, "⚠ Errors")
 
-        # ── Tab 6: Intermediate Code (Three-Address Code) ──────────────────
         self.icg_tab = QWidget()
         icg_layout = QVBoxLayout(self.icg_tab)
         icg_layout.setContentsMargins(6, 6, 6, 6)
@@ -531,7 +909,6 @@ class CrystalCompilerGUI(QMainWindow):
         icg_split = QSplitter(Qt.Orientation.Vertical)
         icg_split.setHandleWidth(4)
 
-        # TAC listing (text) on top
         self.tac_view = QTextEdit()
         self.tac_view.setReadOnly(True)
         self.tac_view.setStyleSheet(f"""
@@ -552,17 +929,30 @@ class CrystalCompilerGUI(QMainWindow):
         )
         icg_split.addWidget(self.tac_view)
 
-        # Quadruple table on the bottom
-        quad_container = QWidget()
-        quad_box = QVBoxLayout(quad_container)
-        quad_box.setContentsMargins(0, 6, 0, 0)
+        tables_container = QWidget()
+        tables_row = QHBoxLayout(tables_container)
+        tables_row.setContentsMargins(0, 6, 0, 0)
+        tables_row.setSpacing(8)
+
+        quad_box = QVBoxLayout()
         quad_box.setSpacing(2)
-        quad_lbl = QLabel("Quadruples")
-        quad_lbl.setStyleSheet("color:#8b949e;font-size:11px;font-weight:bold;")
+        quad_lbl = QLabel("Quadruples  (op, arg1, arg2, result)")
+        quad_lbl.setStyleSheet("color:#22d3ee;font-size:11px;font-weight:bold;")
         quad_box.addWidget(quad_lbl)
         self.quad_table = self._make_table(["#", "op", "arg1", "arg2", "result"])
         quad_box.addWidget(self.quad_table)
-        icg_split.addWidget(quad_container)
+        tables_row.addLayout(quad_box)
+
+        trip_box = QVBoxLayout()
+        trip_box.setSpacing(2)
+        trip_lbl = QLabel("Triples  (op, arg1, arg2 — temps become (i) refs)")
+        trip_lbl.setStyleSheet("color:#facc15;font-size:11px;font-weight:bold;")
+        trip_box.addWidget(trip_lbl)
+        self.triple_table = self._make_table(["index", "op", "arg1", "arg2"])
+        trip_box.addWidget(self.triple_table)
+        tables_row.addLayout(trip_box)
+
+        icg_split.addWidget(tables_container)
 
         icg_split.setStretchFactor(0, 3)
         icg_split.setStretchFactor(1, 2)
@@ -570,12 +960,44 @@ class CrystalCompilerGUI(QMainWindow):
         icg_layout.addWidget(icg_split, 1)
         self.tabs.addTab(self.icg_tab, "⚙ Intermediate Code")
 
-        # ── Tab 7: Code Optimization ────────────────────────────────────────
+        self.dag_tab = QWidget()
+        dag_layout = QVBoxLayout(self.dag_tab)
+        dag_layout.setContentsMargins(6, 6, 6, 6)
+        self.dag_label = QLabel(" DAG — graphical (common sub-expressions merged)")
+        self.dag_label.setStyleSheet(
+            "font-size:13px;font-weight:bold;color:#2dd4bf;padding-bottom:4px;"
+        )
+        dag_layout.addWidget(self.dag_label)
+
+        dhint = QLabel("green = leaf (var/const)   •   purple = operator   •   "
+                       "← shows which variables hold a node   •   scroll = zoom, drag = pan")
+        dhint.setStyleSheet(f"color:{MUTED};font-size:10px;padding-bottom:2px;")
+        dag_layout.addWidget(dhint)
+
+        self.dag_graph = DagGraphView()
+        dag_layout.addWidget(self.dag_graph)
+        self.tabs.addTab(self.dag_tab, " DAG")
+
+        self.bp_tab = QWidget()
+        bp_layout = QVBoxLayout(self.bp_tab)
+        bp_layout.setContentsMargins(6, 6, 6, 6)
+        self.bp_label = QLabel(" Backpatching — one-pass jump code")
+        self.bp_label.setStyleSheet(
+            "font-size:13px;font-weight:bold;color:#a3e635;padding-bottom:4px;"
+        )
+        bp_layout.addWidget(self.bp_label)
+        self.bp_view = self._make_code_view(
+            "Click “ Backpatching” to generate jump code in one pass "
+            "with truelist / falselist / backpatch."
+        )
+        bp_layout.addWidget(self.bp_view)
+        self.tabs.addTab(self.bp_tab, " Backpatching")
+
         self.opt_tab = QWidget()
         opt_layout = QVBoxLayout(self.opt_tab)
         opt_layout.setContentsMargins(6, 6, 6, 6)
 
-        self.opt_label = QLabel("🚀 Code Optimization — Machine-Independent")
+        self.opt_label = QLabel(" Code Optimization — Machine-Independent")
         self.opt_label.setStyleSheet(
             "font-size:13px;font-weight:bold;color:#fb7185;padding-bottom:4px;"
         )
@@ -597,33 +1019,30 @@ class CrystalCompilerGUI(QMainWindow):
         """)
         self.opt_view.setHtml(
             '<p style="color:#6b7280;font-family:Consolas;">Click '
-            '“🚀 Code Optimization” to build basic blocks, the control-flow '
+            '“ Code Optimization” to build basic blocks, the control-flow '
             'graph (PFG), detect loops, and apply machine-independent '
             'optimizations.</p>'
         )
         opt_layout.addWidget(self.opt_view, 1)
-        self.tabs.addTab(self.opt_tab, "🚀 Optimization")
+        self.tabs.addTab(self.opt_tab, " Optimization")
 
-        # ── Tab 8: Assembly / Target Code ───────────────────────────────────
         self.asm_tab = QWidget()
         asm_layout = QVBoxLayout(self.asm_tab)
         asm_layout.setContentsMargins(6, 6, 6, 6)
 
-        # Header row: title + Save .asm button
         asm_head = QHBoxLayout()
-        self.asm_label = QLabel("🖥 Assembly Code — x86 (MASM / emu8086)")
+        self.asm_label = QLabel(" Assembly Code — x86 (MASM / emu8086)")
         self.asm_label.setStyleSheet(
             "font-size:13px;font-weight:bold;color:#2dd4bf;padding-bottom:4px;"
         )
         asm_head.addWidget(self.asm_label)
         asm_head.addStretch()
-        self.save_asm_btn = QPushButton("💾 Save .asm")
+        self.save_asm_btn = QPushButton(" Save .asm")
         self.save_asm_btn.setStyleSheet("background-color:#30363d;color:white;"
                                         "border-radius:6px;padding:3px 10px;font-size:11px;")
         asm_head.addWidget(self.save_asm_btn)
         asm_layout.addLayout(asm_head)
 
-        # Assembly listing (full height — no output panel)
         self.asm_view = QTextEdit()
         self.asm_view.setReadOnly(True)
         self.asm_view.setStyleSheet(f"""
@@ -645,7 +1064,7 @@ class CrystalCompilerGUI(QMainWindow):
         asm_layout.addWidget(self.asm_view, 1)
         self.tabs.addTab(self.asm_tab, "🖥 Assembly")
 
-        self._last_asm_text = ""    # for the Save .asm button
+        self._last_asm_text = ""    
 
         layout.addWidget(self.tabs)
         return widget
@@ -667,15 +1086,36 @@ class CrystalCompilerGUI(QMainWindow):
         """)
         return t
 
+    def _make_code_view(self, placeholder=""):
+        """A read-only monospace HTML view (for TAC / DAG / backpatch / asm)."""
+        v = QTextEdit()
+        v.setReadOnly(True)
+        v.setStyleSheet(f"""
+            QTextEdit {{
+                background-color:#0d1117; border:1px solid {BORDER};
+                border-radius:8px; padding:10px;
+                font-family:Consolas,'Courier New',monospace; font-size:13px;
+                color:#a5f3fc; selection-background-color:#1f3a5f;
+            }}
+            QScrollBar:vertical   {{ background:#161b22; width:8px; border-radius:4px; }}
+            QScrollBar::handle:vertical {{ background:#30363d; border-radius:4px; }}
+            QScrollBar:horizontal {{ background:#161b22; height:8px; border-radius:4px; }}
+            QScrollBar::handle:horizontal {{ background:#30363d; border-radius:4px; }}
+        """)
+        if placeholder:
+            v.setHtml(f'<p style="color:#6b7280;font-family:Consolas;">{placeholder}</p>')
+        return v
+
     # =========================================================================
     # EVENT WIRING
     # =========================================================================
 
     def _connect_events(self):
-        self.open_btn.clicked.connect(self.open_file)
-        self.save_btn.clicked.connect(self.save_file)
+        # Phase 1 — Lexical
         self.tokens_btn.clicked.connect(self.load_tokens)
-        self.semantics_btn.clicked.connect(self.run_syntax)
+        self.symtab_btn.clicked.connect(self.show_symbol_tab)
+        self.errors_btn.clicked.connect(self.show_errors_tab)
+        # Phase 2 — Syntax
         self.lr0_btn.clicked.connect(self.run_lr0)
         self.slr1_btn.clicked.connect(self.run_slr)
         self.clr1_btn.clicked.connect(self.run_clr)
@@ -683,10 +1123,22 @@ class CrystalCompilerGUI(QMainWindow):
         self.first_btn.clicked.connect(self.run_first)
         self.follow_btn.clicked.connect(self.run_follow)
         self.tree_btn.clicked.connect(self.show_current_tree)
+        # Phase 3 — Semantic
+        self.semantics_btn.clicked.connect(self.run_syntax)
+        self.annot_btn.clicked.connect(self.run_annot)
+        # Phase 4 — Intermediate Code
         self.compile_btn.clicked.connect(self.run_icg)
+        self.dag_btn.clicked.connect(self.run_dag)
+        self.backpatch_btn.clicked.connect(self.run_backpatch)
+        # Phase 5 — Optimization
         self.opt_btn.clicked.connect(self.run_opt)
+        # Phase 6 — Code Generation
         self.asm_btn.clicked.connect(self.run_asm)
         self.save_asm_btn.clicked.connect(self.save_assembly)
+
+        # Open / Save moved off the toolbar — available via Ctrl+O / Ctrl+S
+        QShortcut(QKeySequence.StandardKey.Open, self, activated=self.open_file)
+        QShortcut(QKeySequence.StandardKey.Save, self, activated=self.save_file)
 
     # =========================================================================
     # HELPERS
@@ -790,13 +1242,79 @@ class CrystalCompilerGUI(QMainWindow):
     # =========================================================================
 
     def _clear_dfa(self, title=""):
-        """LL(1) has no DFA — show an explanatory note."""
-        self.dfa_label.setText("🔵 DFA — Canonical Collection of LR Items")
-        msg = (f"{title} is a top-down (predictive) parser — it has no LR "
-               "item-set automaton.<br>Run LR(0) / SLR(1) / CLR(1) to view the DFA.")
+        """Non-LR mode with no automaton to show — explanatory note."""
+        self.dfa_label.setText(" DFA / Automaton")
+        msg = (f"{title} has no item-set automaton to display.<br>"
+               "Run LR(0) / SLR(1) / CLR(1) for the LR DFA, or LL(1) for "
+               "the top-down transition diagrams.")
         self.dfa_view.setHtml(
             f'<p style="color:#6b7280;font-family:Consolas;font-size:12px;">{msg}</p>'
         )
+
+    def _show_ll1_transition_diagrams(self):
+        """
+        Top-down 'DFA' for the predictive parser: one transition diagram per
+        non-terminal (states + symbol-labelled edges), the LL(1) equivalent of
+        the LR item-set automaton.
+        """
+        diagrams = self._get_engine().transition_diagrams()
+
+        def esc(s):
+            return (str(s).replace("&", "&amp;")
+                          .replace("<", "&lt;").replace(">", "&gt;"))
+
+        def sym_html(sym):
+            if sym == EPS:
+                return '<span style="color:#a78bfa;font-weight:bold;">ε</span>'
+            if sym in GRAMMAR:          # non-terminal
+                return f'<span style="color:#67e8f9;">&lt;{esc(sym)}&gt;</span>'
+            return f'<span style="color:#4ade80;font-weight:bold;">{esc(sym)}</span>'
+
+        def state_html(nt, sid, start, final):
+            mark = ""
+            if sid == start:
+                mark = ' <span style="color:#22d3ee;">▸start</span>'
+            if sid == final:
+                mark = ' <span style="color:#fb923c;">((final))</span>'
+            return (f'<span style="color:#facc15;font-weight:bold;">{esc(nt)}{sid}</span>'
+                    + mark)
+
+        lines = []
+        for nt, d in diagrams.items():
+            start, final = d["start"], d["final"]
+            lines.append(
+                f'<div style="margin:8px 0 2px 0;">'
+                f'<span style="color:#c084fc;font-weight:bold;background:#1e293b;'
+                f'padding:1px 8px;border-radius:4px;">&lt;{esc(nt)}&gt;</span>'
+                f'<span style="color:#475569;">   start </span>'
+                f'<span style="color:#22d3ee;">{esc(nt)}{start}</span>'
+                f'<span style="color:#475569;">,  final </span>'
+                f'<span style="color:#fb923c;">{esc(nt)}{final}</span></div>'
+            )
+            for (src, sym, dst) in d["edges"]:
+                lines.append(
+                    f'<div style="margin-left:18px;line-height:1.5;">'
+                    f'<span style="color:#facc15;">{esc(nt)}{src}</span>'
+                    f'<span style="color:#475569;"> ──[ </span>{sym_html(sym)}'
+                    f'<span style="color:#475569;"> ]──▶ </span>'
+                    f'<span style="color:#facc15;">{esc(nt)}{dst}</span>'
+                    + (' <span style="color:#fb923c;">((final))</span>'
+                       if dst == final else "")
+                    + '</div>'
+                )
+
+        n_states = sum(len(d["states"]) for d in diagrams.values())
+        n_edges  = sum(len(d["edges"]) for d in diagrams.values())
+        self.dfa_label.setText(
+            f" Top-Down DFA — LL(1) Transition Diagrams "
+            f"({len(diagrams)} non-terminals, {n_states} states, {n_edges} edges)"
+        )
+        body = "\n".join(lines)
+        self.dfa_view.setHtml(
+            f'<div style="font-family:Consolas,\'Courier New\',monospace;'
+            f'font-size:12px;background:#0d1117;color:#a5f3fc;">{body}</div>'
+        )
+        self.dfa_view.verticalScrollBar().setValue(0)
 
     def _format_item(self, item, show_lookahead: bool) -> str:
         """Render one LR item as 'LHS → α • β   , lookahead'."""
@@ -871,7 +1389,7 @@ class CrystalCompilerGUI(QMainWindow):
                 )
 
         self.dfa_label.setText(
-            f"🔵 {title} DFA — {len(states)} states, {len(trans)} transitions"
+            f" {title} DFA — {len(states)} states, {len(trans)} transitions"
         )
         body = "\n".join(lines)
         self.dfa_view.setHtml(
@@ -998,6 +1516,7 @@ class CrystalCompilerGUI(QMainWindow):
         </div>
         """
         self.tree_view.setHtml(html)
+        self.tree_stack.setCurrentIndex(1)        # show the text error card
         self.tabs.setCurrentIndex(2)
         self.status.showMessage(f"{parser_name} Syntax Error — {loc} — {message.splitlines()[0]}")
 
@@ -1026,7 +1545,9 @@ class CrystalCompilerGUI(QMainWindow):
         labels = {
             "LR0": "LR(0)", "SLR": "SLR(1)",
             "CLR": "CLR(1)", "LL1": "LL(1)", "SYNTAX": "Syntax",
-            "ICG": "Intermediate Code", "OPT": "Code Optimization",
+            "ANNOT": "Annotated Tree",
+            "ICG": "Intermediate Code", "DAG": "DAG",
+            "BACKPATCH": "Backpatching", "OPT": "Code Optimization",
             "ASM": "Assembly Code",
         }
         self.status.showMessage(
@@ -1039,16 +1560,11 @@ class CrystalCompilerGUI(QMainWindow):
         self._worker.start()
 
     def _set_buttons_enabled(self, enabled: bool):
-        for b in (self.compile_btn, self.opt_btn, self.asm_btn, self.semantics_btn,
+        for b in (self.compile_btn, self.dag_btn, self.backpatch_btn,
+                  self.opt_btn, self.asm_btn, self.semantics_btn, self.annot_btn,
                   self.lr0_btn, self.slr1_btn, self.clr1_btn, self.ll1_btn,
                   self.first_btn, self.follow_btn, self.tree_btn):
             b.setEnabled(enabled)
-        # Grey out when disabled
-        style_off = "opacity:0.5;" if not enabled else ""
-        for b in (self.compile_btn, self.opt_btn, self.asm_btn, self.semantics_btn,
-                  self.lr0_btn, self.slr1_btn, self.clr1_btn, self.ll1_btn):
-            b.setStyleSheet(b.styleSheet().replace("opacity:0.5;", "")
-                            + style_off)
 
     def _on_worker_done(self, mode: str, result: dict):
         self._set_buttons_enabled(True)
@@ -1056,7 +1572,9 @@ class CrystalCompilerGUI(QMainWindow):
         labels = {
             "LR0": "LR(0)", "SLR": "SLR(1)",
             "CLR": "CLR(1)", "LL1": "LL(1)", "SYNTAX": "Syntax",
-            "ICG": "Intermediate Code", "OPT": "Code Optimization",
+            "ANNOT": "Annotated Tree",
+            "ICG": "Intermediate Code", "DAG": "DAG",
+            "BACKPATCH": "Backpatching", "OPT": "Code Optimization",
             "ASM": "Assembly Code",
         }
         name = labels.get(mode, mode)
@@ -1066,11 +1584,13 @@ class CrystalCompilerGUI(QMainWindow):
             ACTION, GOTO, states, conflicts = result["table"]
             self._show_lr_table(ACTION, GOTO, states, conflicts, name)
 
-        # ── Show DFA (LR modes) or clear it (LL(1)) ──
+        # ── Show DFA: LR item-set automaton, or LL(1) transition diagrams ──
         if "dfa" in result:
             states, trans, dfa_mode = result["dfa"]
             self._show_dfa(states, trans, name)
-        elif mode in ("LL1", "SYNTAX"):
+        elif mode == "LL1":
+            self._show_ll1_transition_diagrams()
+        elif mode == "SYNTAX":
             self._clear_dfa(name)
 
         # ── Show LL(1) table ──
@@ -1096,6 +1616,18 @@ class CrystalCompilerGUI(QMainWindow):
                 self.status.showMessage(
                     f"Intermediate Code generated — {len(quads)} instruction(s)"
                 )
+            elif mode == "DAG":
+                self._show_dag(result.get("dag_blocks", []))
+                self.status.showMessage(
+                    f"DAG built — {len(result.get('dag_blocks', []))} basic block(s)"
+                )
+            elif mode == "BACKPATCH":
+                instrs, log = result.get("bp", ([], []))
+                self._show_backpatch(instrs, log)
+                self.status.showMessage(
+                    f"Backpatching complete — {len(instrs)} quad(s), "
+                    f"{len(log)} list operation(s)"
+                )
             elif mode == "OPT":
                 quads = result.get("tac", [])
                 self._show_tac(quads)          # keep ICG tab populated too
@@ -1111,13 +1643,18 @@ class CrystalCompilerGUI(QMainWindow):
             elif mode == "ASM":
                 asm_text = result.get("asm_text", "")
                 self._show_assembly(asm_text)
-                self.status.showMessage("Assembly code generated ✔")
+                self.status.showMessage("Register-machine assembly generated ✔")
             elif mode == "SYNTAX":
                 html = self._syntax_to_html(tree)
                 self.syntax_view.setHtml(html)
                 self.syntax_view.verticalScrollBar().setValue(0)
                 self.tabs.setCurrentIndex(3)
                 self.status.showMessage("Syntax Analysis complete — SDD annotated AST shown")
+            elif mode == "ANNOT":
+                self._show_annotated_tree(tree)
+                self.status.showMessage(
+                    "Semantic Annotated Tree built — nodes decorated with values"
+                )
             elif "table" in result:
                 n = len(result["table"][2])
                 self.status.showMessage(f"{name}: {n} states — ACCEPT")
@@ -1143,10 +1680,26 @@ class CrystalCompilerGUI(QMainWindow):
     def run_clr(self):    self._start_worker("CLR")
     def run_ll1(self):    self._start_worker("LL1")
     def run_syntax(self): self._start_worker("SYNTAX")
+    def run_annot(self):  self._start_worker("ANNOT")
     def run_icg(self):    self._start_worker("ICG")
+    def run_dag(self):    self._start_worker("DAG")
+    def run_backpatch(self): self._start_worker("BACKPATCH")
     def run_opt(self):    self._start_worker("OPT")
 
     def run_asm(self):    self._start_worker("ASM")
+
+    # ── Phase-1 helpers: run the lexer then show the relevant tab ─────────
+    def show_symbol_tab(self):
+        self.load_tokens()
+        idx = self.tabs.indexOf(self.symbol_table.parentWidget())
+        if idx != -1:
+            self.tabs.setCurrentIndex(idx)
+
+    def show_errors_tab(self):
+        self.load_tokens()
+        idx = self.tabs.indexOf(self.error_table.parentWidget())
+        if idx != -1:
+            self.tabs.setCurrentIndex(idx)
 
     def save_assembly(self):
         """Save the generated assembly to a .asm file for emu8086 / MASM."""
@@ -1283,28 +1836,84 @@ class CrystalCompilerGUI(QMainWindow):
 
     # =========================================================================
 
+    def _used_nonterminals(self, tokens):
+        """
+        Return the non-terminals that actually appear in the leftmost
+        derivation of the editor's code (in order of first use).
+
+        Runs the predictive LL(1) parser but only records which non-terminals
+        get expanded — it stops gracefully at the first error / incomplete
+        point, so it works while you are still typing.
+        """
+        engine = self._get_engine()
+        table  = engine.build_ll1_table()
+        tok_types = [t["type"] for t in tokens] + [END]
+
+        used, seen = [], set()
+        stack = [END, START]
+        i, guard = 0, 0
+        while stack and guard < 100000:
+            guard += 1
+            sym = stack.pop()
+            if sym == END:
+                break
+            if sym in GRAMMAR:                      # non-terminal → expand
+                if sym not in seen:
+                    seen.add(sym); used.append(sym)
+                prod = table.get((sym, tok_types[i]))
+                if prod is None:
+                    break                           # error / incomplete — stop here
+                if prod != [EPS]:
+                    for s in reversed(prod):
+                        stack.append(s)
+            else:                                   # terminal → must match
+                if i < len(tok_types) and sym == tok_types[i]:
+                    i += 1
+                else:
+                    break
+        return used
+
     def run_first(self):
         engine = self._get_engine()
-        first = engine.first_sets()
-        self._show_set_table(first, "FIRST")
+        first  = engine.first_sets()
+        used   = self._used_nonterminals(self._get_tokens())
+        self._show_set_table(first, "FIRST", only=used)
         self.tabs.setCurrentIndex(0)
-        self.status.showMessage("FIRST Sets shown ✔")
+        if used:
+            self.status.showMessage(
+                f"FIRST sets for YOUR code — {len(used)} non-terminal(s) used ✔"
+            )
+        else:
+            self.status.showMessage("FIRST sets — full grammar (editor is empty)")
 
     def run_follow(self):
         engine = self._get_engine()
         follow = engine.follow_sets()
-        self._show_set_table(follow, "FOLLOW")
+        used   = self._used_nonterminals(self._get_tokens())
+        self._show_set_table(follow, "FOLLOW", only=used)
         self.tabs.setCurrentIndex(0)
-        self.status.showMessage("FOLLOW Sets shown ✔")
+        if used:
+            self.status.showMessage(
+                f"FOLLOW sets for YOUR code — {len(used)} non-terminal(s) used ✔"
+            )
+        else:
+            self.status.showMessage("FOLLOW sets — full grammar (editor is empty)")
 
-    def _show_set_table(self, data, title):
-        """Populate token_table with { NT: set } data."""
+    def _show_set_table(self, data, title, only=None):
+        """Populate token_table with { NT: set } data.
+
+        If `only` is a non-empty list, show just those non-terminals (in that
+        order) — used to restrict FIRST/FOLLOW to the editor's code.
+        """
         self.token_table.clearContents()
         self.token_table.setColumnCount(2)
         self.token_table.setHorizontalHeaderLabels([f"{title}( Non-Terminal )", "Terminals"])
         self.token_table.horizontalHeader().setStretchLastSection(True)
 
-        rows = [(nt, v) for nt, v in data.items() if nt in GRAMMAR]
+        if only:
+            rows = [(nt, data[nt]) for nt in only if nt in data]
+        else:
+            rows = [(nt, v) for nt, v in data.items() if nt in GRAMMAR]
         self.token_table.setRowCount(len(rows))
 
         for row, (nt, tset) in enumerate(rows):
@@ -1433,13 +2042,13 @@ class CrystalCompilerGUI(QMainWindow):
             self.tree_view.setHtml(
                 '<p style="color:#6b7280;font-family:Consolas;">No parse tree.</p>'
             )
+            self.tree_stack.setCurrentIndex(1)
             self.tabs.setCurrentIndex(2)
             return
 
-        html = self._tree_to_html(root_node)
-        self.tree_view.setHtml(html)
-        # Scroll to top
-        self.tree_view.verticalScrollBar().setValue(0)
+        # Draw the colourful graphical tree (page 0 of the stack).
+        self.tree_graph.render_tree(root_node)
+        self.tree_stack.setCurrentIndex(0)
         self.tabs.setCurrentIndex(2)
 
     def show_current_tree(self):
@@ -1448,6 +2057,90 @@ class CrystalCompilerGUI(QMainWindow):
         else:
             self._display_tree(self._last_tree_root)
             self.status.showMessage("Parse Tree displayed ✔")
+
+    # =========================================================================
+    # SEMANTIC ANNOTATED TREE  (parse tree decorated with synthesised values)
+    # =========================================================================
+
+    def _annot_to_html(self, root: Node) -> str:
+        """
+        Render the parse tree decorated with each node's synthesised VALUE
+        attribute (node.aval), e.g.  Expr  { val = 30 }.
+        """
+        lines: list[str] = []
+
+        def esc(s):
+            return (str(s).replace("&", "&amp;")
+                          .replace("<", "&lt;").replace(">", "&gt;"))
+
+        def span(text, color, bold=False, italic=False):
+            b  = "font-weight:bold;"  if bold   else ""
+            it = "font-style:italic;" if italic else ""
+            return f'<span style="color:{color};{b}{it}">{esc(text)}</span>'
+
+        def val_badge(node):
+            aval = getattr(node, "aval", None)
+            if aval is None or aval == "":
+                return ""
+            return ("  " + f'<span style="color:#fde68a;background:#1e293b;'
+                    f'border:1px solid #fde68a55;border-radius:4px;padding:0 6px;'
+                    f'font-size:11px;">val = {esc(aval)}</span>')
+
+        def node_label(node):
+            is_real = node.is_terminal() and bool(node.tok_type)
+            is_eps  = node.is_terminal() and not node.tok_type
+            if is_real:
+                lbl  = span(node.tok_type, "#4ade80", bold=True)
+                lbl += "  " + span(f"«{node.name}»", "#7dd3fc")
+            elif is_eps:
+                lbl = span(node.name, "#475569", italic=True)
+            else:
+                lbl = span(node.name, "#67e8f9", bold=True)
+            return lbl + val_badge(node)
+
+        def render(node, prefix, is_last):
+            connector = "└── " if is_last else "├── "
+            lines.append(
+                '<p style="margin:0;padding:0;line-height:1.6;white-space:nowrap;">'
+                + span(prefix + connector, "#334155")
+                + node_label(node)
+                + "</p>"
+            )
+            if node.kids:
+                child_prefix = prefix + ("    " if is_last else "│   ")
+                for i, child in enumerate(node.kids):
+                    render(child, child_prefix, i == len(node.kids) - 1)
+
+        # Header + legend
+        lines.append(
+            '<p style="margin:0 0 8px 0;padding:6px 0;line-height:2;'
+            'border-bottom:1px solid #1e293b;">'
+            + span("SEMANTIC ANNOTATED PARSE TREE", "#c084fc", bold=True)
+            + "  " + span("— each node synthesises a value", "#64748b", italic=True)
+            + "</p>"
+        )
+
+        # Root
+        lines.append(
+            '<p style="margin:0;padding:0;line-height:1.6;">'
+            + node_label(root) + "</p>"
+        )
+        for i, child in enumerate(root.kids):
+            render(child, "", i == len(root.kids) - 1)
+
+        body = "\n".join(lines)
+        return (
+            f'<div style="font-family:Consolas,\'Courier New\',monospace;'
+            f'font-size:13px;background:#0d1117;color:#a5f3fc;padding:10px;">'
+            + body + "</div>"
+        )
+
+    def _show_annotated_tree(self, root: Node):
+        # Draw the colourful graphical SDD tree with each node's value.
+        self.annot_graph.render_tree(root, annotated=True)
+        idx = self.tabs.indexOf(self.annot_tab)
+        if idx != -1:
+            self.tabs.setCurrentIndex(idx)
 
     # =========================================================================
     # TOKENS
@@ -1533,21 +2226,32 @@ class CrystalCompilerGUI(QMainWindow):
             kinds = Counter(e["kind"] for e in errors)
             summary = ", ".join(f"{v} {k.lower()}" for k, v in kinds.items())
             self.status.showMessage(
-                f"⚠  {len(tokens)} tokens  •  {len(errors)} error(s) "
+                f"  {len(tokens)} tokens  •  {len(errors)} error(s) "
                 f"({summary}) — see ⚠ Errors tab"
             )
         else:
             self.status.showMessage(
-                f"✅  {len(tokens)} tokens  •  " +
+                f"  {len(tokens)} tokens  •  " +
                 "  ".join(f"{k}: {v}" for k, v in counts.items())
             )
 
     def _collect_errors(self, all_tokens, valid_tokens):
-        """Gather Lexical, Syntax and Semantic errors into one unified list."""
+        """
+        Gather Lexical, Syntax and Semantic errors into one unified list,
+        respecting compiler phase order:
+
+          • Lexical  — illegal tokens (always reported).
+          • Syntax   — unbalanced delimiters AND real grammar errors from the
+                       LL(1) parser. Only reported if lexing is clean.
+          • Semantic — undeclared / redeclared identifiers. Only reported if
+                       the program is lexically and syntactically valid (so we
+                       don't emit false 'undeclared' noise on broken code).
+        """
         errors = []
 
-        # Lexical — from the raw lexer output (these tokens carry .error).
-        for e in lexer_mod.lexical_errors(all_tokens):
+        # ── Phase 1: Lexical ────────────────────────────────────────────
+        lex = lexer_mod.lexical_errors(all_tokens)
+        for e in lex:
             errors.append({
                 "kind":  "Lexical",
                 "line":  e.get("line"),
@@ -1555,12 +2259,42 @@ class CrystalCompilerGUI(QMainWindow):
                 "value": e.get("value"),
                 "error": e.get("error", "Lexical error"),
             })
+        if lex:
+            return self._sort_errors(errors)
 
-        # Syntax + Semantic — run on the valid token stream.
-        errors += lexer_mod.syntax_errors(valid_tokens)
+        # ── Phase 2: Syntax ─────────────────────────────────────────────
+        syntax = list(lexer_mod.syntax_errors(valid_tokens))   # unbalanced ((, {{, [[
+
+        # Real grammar errors from the LL(1) parser (only when brackets balance).
+        if not syntax:
+            try:
+                self._get_engine().ll1_parse(valid_tokens)
+            except ValueError as pe:
+                a   = pe.args
+                msg = (a[0] if a else str(pe)).splitlines()[0]
+                ln  = a[1] if len(a) > 1 else None
+                col = a[2] if len(a) > 2 else None
+                # find the offending token's value for the table, if any
+                val = ""
+                for t in valid_tokens:
+                    if t.get("line") == ln and t.get("col") == col:
+                        val = t.get("value", "")
+                        break
+                syntax.append({
+                    "kind": "Syntax", "line": ln, "col": col,
+                    "value": val, "error": msg,
+                })
+
+        errors += syntax
+        if syntax:
+            return self._sort_errors(errors)
+
+        # ── Phase 3: Semantic ───────────────────────────────────────────
         errors += lexer_mod.semantic_errors(valid_tokens)
+        return self._sort_errors(errors)
 
-        # Lexical first, then by source position.
+    @staticmethod
+    def _sort_errors(errors):
         order = {"Lexical": 0, "Syntax": 1, "Semantic": 2}
         errors.sort(key=lambda e: (e.get("line") or 0, e.get("col") or 0,
                                    order.get(e["kind"], 9)))
@@ -1656,24 +2390,26 @@ class CrystalCompilerGUI(QMainWindow):
     def _show_tac(self, quads):
         """Render TAC as a code listing (top) and a quadruple table (bottom)."""
         # ── Code listing ──────────────────────────────────────────────────
+        width = len(str(len(quads)))           # for aligned line numbers
         lines = []
-        for q in quads:
+        for i, q in enumerate(quads, start=1):
+            num = (f'<span style="color:#475569;">{str(i).rjust(width)}│ </span>')
             txt = self._esc(q.to_text())
             if q.op == "label":
                 # Labels flush-left, highlighted.
                 lines.append(
-                    f'<div style="color:#facc15;font-weight:bold;">{txt}</div>'
+                    f'<div>{num}<span style="color:#facc15;font-weight:bold;">{txt}</span></div>'
                 )
             elif q.op in ("func", "endfunc"):
                 lines.append(
-                    f'<div style="color:#c084fc;font-weight:bold;">{txt}</div>'
+                    f'<div>{num}<span style="color:#c084fc;font-weight:bold;">{txt}</span></div>'
                 )
             elif q.op in ("goto", "ifFalse", "if"):
-                lines.append(f'<div style="color:#fb923c;">{txt}</div>')
+                lines.append(f'<div>{num}<span style="color:#fb923c;">{txt}</span></div>')
             elif q.op in ("display", "read", "param", "return"):
-                lines.append(f'<div style="color:#4ade80;">{txt}</div>')
+                lines.append(f'<div>{num}<span style="color:#4ade80;">{txt}</span></div>')
             else:
-                lines.append(f'<div style="color:#a5f3fc;">{txt}</div>')
+                lines.append(f'<div>{num}<span style="color:#a5f3fc;">{txt}</span></div>')
 
         if not lines:
             lines.append('<div style="color:#6b7280;">No code generated.</div>')
@@ -1711,8 +2447,34 @@ class CrystalCompilerGUI(QMainWindow):
         self.quad_table.resizeColumnsToContents()
         self.quad_table.horizontalHeader().setStretchLastSection(True)
 
+        # ── Triples table ─────────────────────────────────────────────────
+        import intermediate_code as icg
+        triples = icg.to_triples(quads)
+        self.triple_table.clearContents()
+        self.triple_table.setColumnCount(4)
+        self.triple_table.setHorizontalHeaderLabels(["index", "op", "arg1", "arg2"])
+        self.triple_table.setRowCount(len(triples))
+        self.triple_table.horizontalHeader().setStretchLastSection(True)
+
+        for row, t in enumerate(triples):
+            cells = [
+                (f"({t['idx']})", "#8b949e"),
+                (t["op"],         "#22d3ee"),
+                (t["arg1"],       "#e2e8f0"),
+                (t["arg2"],       "#fde68a"),     # (i) back-refs in amber
+            ]
+            for col, (text, fg) in enumerate(cells):
+                item = QTableWidgetItem(text)
+                item.setForeground(QColor(fg))
+                item.setBackground(QColor(DARK_BG))
+                self.triple_table.setItem(row, col, item)
+
+        self.triple_table.resizeColumnsToContents()
+        self.triple_table.horizontalHeader().setStretchLastSection(True)
+
         self.icg_label.setText(
-            f"⚙ Intermediate Code — Three-Address Code ({len(quads)} instructions)"
+            f"⚙ Intermediate Code — Three-Address Code (label-based) "
+            f"— {len(quads)} instructions, {len(triples)} triples"
         )
 
         idx = self.tabs.indexOf(self.icg_tab)
@@ -1820,10 +2582,23 @@ class CrystalCompilerGUI(QMainWindow):
         else:
             out.append('<div style="color:#6b7280;margin-left:10px;">(nothing to optimize)</div>')
 
-        # ── 5. Before / After code ──────────────────────────────────────
+        # ── 5. Before / After code (with line numbers) ──────────────────
         out.append(h("5️⃣  RESULT  —  Before vs After", "#fb7185"))
-        before_txt = esc(icg.to_text(res["original"]))
-        after_txt  = esc(icg.to_text(res["optimized"]))
+
+        def numbered(quads):
+            if not quads:
+                return "(empty)"
+            width = len(str(len(quads)))
+            rows = []
+            for i, q in enumerate(quads, start=1):
+                rows.append(
+                    f'<span style="color:#475569;">{str(i).rjust(width)}│ </span>'
+                    + esc(q.to_text())
+                )
+            return "\n".join(rows)
+
+        before_txt = numbered(res["original"])
+        after_txt  = numbered(res["optimized"])
         out.append(
             '<table width="100%" cellspacing="0" cellpadding="6" '
             'style="margin-top:6px;"><tr style="vertical-align:top;">'
@@ -1858,7 +2633,7 @@ class CrystalCompilerGUI(QMainWindow):
     # =========================================================================
 
     def _show_assembly(self, asm_text):
-        """Render the generated assembly listing (code only)."""
+        """Render the generated assembly listing (clean code only — copyable)."""
         self._last_asm_text = asm_text
 
         def esc(s):
@@ -1901,8 +2676,67 @@ class CrystalCompilerGUI(QMainWindow):
         self.asm_view.setHtml(html)
         self.asm_view.verticalScrollBar().setValue(0)
 
-        self.asm_label.setText("🖥 Assembly Code — x86 (MASM / emu8086)")
+        self.asm_label.setText("🖥 Assembly Code — x86 Intel syntax (emu8086 / MASM)")
         idx = self.tabs.indexOf(self.asm_tab)
+        if idx != -1:
+            self.tabs.setCurrentIndex(idx)
+
+    # =========================================================================
+    # DAG + BACKPATCHING DISPLAY
+    # =========================================================================
+
+    def _show_dag(self, dags):
+        """Render the DAG of every basic block as a colourful graph."""
+        self.dag_graph.render_dags(dags)
+        n_cse = sum(len(d.common_subexpressions()) for d in dags)
+        self.dag_label.setText(
+            f" DAG — graphical ({len(dags)} basic block(s), "
+            f"{n_cse} shared sub-expression(s) merged)"
+        )
+        idx = self.tabs.indexOf(self.dag_tab)
+        if idx != -1:
+            self.tabs.setCurrentIndex(idx)
+
+    def _show_backpatch(self, instrs, log):
+        """Render backpatched instructions (top) and the backpatch log."""
+        def esc(s):
+            return (str(s).replace("&", "&amp;")
+                          .replace("<", "&lt;").replace(">", "&gt;"))
+
+        code_lines = []
+        for ins in instrs:
+            body = esc(ins.text())
+            if ins.kind in ("cond", "goto"):
+                code_lines.append(
+                    f'<div><span style="color:#facc15;">{ins.idx}:</span>  '
+                    f'<span style="color:#fb923c;">{body}</span></div>'
+                )
+            else:
+                code_lines.append(
+                    f'<div><span style="color:#facc15;">{ins.idx}:</span>  '
+                    f'<span style="color:#a5f3fc;">{body}</span></div>'
+                )
+
+        log_lines = [
+            f'<div style="color:#a3e635;">• {esc(c)}</div>' for c in log
+        ]
+
+        html = (
+            '<div style="font-family:Consolas,\'Courier New\',monospace;'
+            'font-size:13px;line-height:1.5;background:#0d1117;">'
+            '<div style="color:#5eead4;font-weight:bold;margin-bottom:4px;">'
+            'Generated quads (targets backpatched)</div>'
+            + "\n".join(code_lines)
+            + '<div style="color:#5eead4;font-weight:bold;margin:10px 0 4px 0;'
+              'border-top:1px solid #1e293b;padding-top:8px;">'
+              'Backpatch list operations</div>'
+            + ("\n".join(log_lines) if log_lines
+               else '<div style="color:#64748b;">(no jump lists — straight-line code)</div>')
+            + "</div>"
+        )
+        self.bp_view.setHtml(html)
+        self.bp_view.verticalScrollBar().setValue(0)
+        idx = self.tabs.indexOf(self.bp_tab)
         if idx != -1:
             self.tabs.setCurrentIndex(idx)
 
@@ -1918,6 +2752,37 @@ class CrystalCompilerGUI(QMainWindow):
         """)
         lbl.setFixedHeight(22)
         return lbl
+
+    # =========================================================================
+    # CODE EXAMPLES  (insert a ready-made program into the editor)
+    # =========================================================================
+
+    def _show_examples_menu(self):
+        """Pop up a menu of sample programs; the chosen one fills the editor."""
+        try:
+            from code_examples import EXAMPLES
+        except Exception as e:
+            QMessageBox.warning(self, "Examples", f"Could not load examples:\n{e}")
+            return
+
+        menu = QMenu(self)
+        menu.setStyleSheet(f"""
+            QMenu {{ background-color:{PANEL_BG}; color:{TEXT};
+                     border:1px solid {BORDER}; padding:4px; }}
+            QMenu::item {{ padding:6px 22px; border-radius:4px; }}
+            QMenu::item:selected {{ background-color:#1f6feb33; color:white; }}
+        """)
+        for name, code in EXAMPLES:
+            act = menu.addAction(name)
+            act.triggered.connect(lambda _checked, c=code, n=name: self._insert_example(c, n))
+        # show the menu just under the button
+        menu.exec(self.examples_btn.mapToGlobal(
+            self.examples_btn.rect().bottomLeft()))
+
+    def _insert_example(self, code, name):
+        """Replace the editor contents with the chosen sample program."""
+        self.editor.setPlainText(code)
+        self.status.showMessage(f"Inserted example: {name}  •  now click any phase to run it")
 
     # =========================================================================
     # FILE OPERATIONS

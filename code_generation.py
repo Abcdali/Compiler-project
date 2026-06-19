@@ -1,20 +1,4 @@
-# =============================================================================
-# code_generation.py  —  Target Code Generation (x86 assembly)
-# =============================================================================
-# Phase: Code Generation  (the FINAL phase of the compiler)
-#
-# Takes the (optimized) Three-Address Code produced by intermediate_code.py /
-# code_optimization.py and emits x86-style assembly using a simple
-# accumulator model:
-#
-#       AX  =  the working register (accumulator)
-#       every variable / temporary  →  a word in the .data section
-#
-# The generated text is MASM / emu8086 friendly, so it can be pasted into an
-# assembler.  A built-in AssemblySimulator also executes the SAME instructions
-# in Python, so the GUI can show the real program output without any external
-# tool installed.
-# =============================================================================
+
 
 from intermediate_code import Quad
 
@@ -43,6 +27,167 @@ def _is_number(x):
 
 def _is_string(x):
     return isinstance(x, str) and len(x) >= 2 and x[0] == '"' and x[-1] == '"'
+
+
+# =============================================================================
+# Compact REGISTER-MACHINE code generator  (registers R0 … R20)
+# =============================================================================
+# A small, readable target code — no DOS I/O procedures.  Each value lives in
+# a register; memory variables are LOAD-ed / STORE-d; I/O is single pseudo-ops
+# (READ / PRINT / PRINTS).  Much shorter than the 8086 listing.
+# =============================================================================
+class RegisterCodeGenerator:
+    ARITH  = {"+": "ADD", "-": "SUB", "*": "MUL",
+              "/": "DIV", "%": "MOD", "**": "POW"}
+    RELSET = {"==": "SEQ", "!=": "SNE", "<": "SLT",
+              ">": "SGT", "<=": "SLE", ">=": "SGE"}
+    NREG   = 21                     # R0 … R20
+
+    def __init__(self):
+        self.lines   = []
+        self.vars    = []
+        self._vseen  = set()
+        self.strings = {}           # label → string literal
+        self._next   = 0            # round-robin register counter
+        self.reg_of  = {}           # value name currently held in a register
+
+    # ── helpers ─────────────────────────────────────────────────────────
+    def _emit(self, text):
+        self.lines.append(text)
+
+    def _reg(self):
+        r = f"R{self._next % self.NREG}"
+        self._next += 1
+        return r
+
+    def _use_var(self, name):
+        s = str(name)
+        if name is not None and not _is_number(s) and not _is_string(s) \
+                and s not in self._vseen:
+            self._vseen.add(s)
+            self.vars.append(s)
+
+    def _str_label(self, literal):
+        for lbl, lit in self.strings.items():
+            if lit == literal:
+                return lbl
+        lbl = f"msg{len(self.strings)}"
+        self.strings[lbl] = literal
+        return lbl
+
+    def _materialize(self, a):
+        """Return the register that holds operand `a` (load if needed)."""
+        s = str(a)
+        if _is_number(s):
+            r = self._reg(); self._emit(f"    MOV   {r}, #{s}"); return r
+        if _is_string(s):
+            lbl = self._str_label(s)
+            r = self._reg(); self._emit(f"    LEA   {r}, {lbl}"); return r
+        if s in self.reg_of:
+            return self.reg_of[s]            # already in a register
+        self._use_var(s)
+        r = self._reg(); self._emit(f"    LOAD  {r}, {s}")
+        self.reg_of[s] = r
+        return r
+
+    # ── main ────────────────────────────────────────────────────────────
+    def generate(self, quads):
+        for q in quads:
+            self._gen(q)
+        self._emit("    HALT")
+        return self
+
+    def _gen(self, q):
+        op = q.op
+        if op in self.ARITH or op in self.RELSET:
+            ra = self._materialize(q.arg1)
+            rb = self._materialize(q.arg2)
+            rt = self._reg()
+            mnem = self.ARITH.get(op) or self.RELSET.get(op)
+            self._emit(f"    {mnem:5} {rt}, {ra}, {rb}     ; "
+                       f"{q.result} = {q.arg1} {op} {q.arg2}")
+            self.reg_of[str(q.result)] = rt
+
+        elif op == "=":
+            ra = self._materialize(q.arg1)
+            self._use_var(str(q.result))
+            self._emit(f"    STORE {q.result}, {ra}     ; {q.result} = {q.arg1}")
+            self.reg_of[str(q.result)] = ra
+
+        elif op == "ifFalse":
+            r = self._materialize(q.arg1)
+            self._emit(f"    JZ    {r}, {q.result}     ; ifFalse {q.arg1}")
+            self.reg_of.clear()             # registers die across a branch
+
+        elif op == "if":
+            r = self._materialize(q.arg1)
+            self._emit(f"    JNZ   {r}, {q.result}     ; if {q.arg1}")
+            self.reg_of.clear()
+
+        elif op == "goto":
+            self._emit(f"    JMP   {q.result}")
+            self.reg_of.clear()
+
+        elif op == "label":
+            self._emit(f"{q.result}:")
+            self.reg_of.clear()             # join point — nothing in registers
+
+        elif op == "display":
+            if _is_string(q.arg1):
+                self._emit(f"    PRINTS {self._str_label(q.arg1)}     ; display {q.arg1}")
+            else:
+                r = self._materialize(q.arg1)
+                self._emit(f"    PRINT {r}     ; display {q.arg1}")
+
+        elif op == "read":
+            self._use_var(str(q.arg1))
+            r = self._reg()
+            self._emit(f"    READ  {r}     ; read {q.arg1}")
+            self._emit(f"    STORE {q.arg1}, {r}")
+            self.reg_of[str(q.arg1)] = r
+
+        elif op == "param":
+            r = self._materialize(q.arg1)
+            self._emit(f"    PARAM {r}")
+
+        elif op == "return":
+            if q.arg1 is not None:
+                r = self._materialize(q.arg1)
+                self._emit(f"    RET   {r}")
+            else:
+                self._emit("    RET")
+
+        elif op == "func":
+            self._emit(f"{q.result}:")
+            self.reg_of.clear()
+
+        elif op == "endfunc":
+            self._emit("    RET")
+            self.reg_of.clear()
+
+    # ── full listing ────────────────────────────────────────────────────
+    def to_text(self):
+        out = ["; ==========================================",
+               ";  Register-machine target code  (R0 … R20)",
+               "; ==========================================",
+               "", ".CODE"]
+        out.extend(self.lines)
+        out.append("")
+        out.append(".DATA")
+        for v in self.vars:
+            out.append(f"    {v:<8} : 0")
+        for lbl, lit in self.strings.items():
+            out.append(f"    {lbl:<8} : {lit}")
+        if not self.vars and not self.strings:
+            out.append("    ; (no data)")
+        return "\n".join(out)
+
+
+def generate_registers(quads):
+    """Return a RegisterCodeGenerator that has produced compact register code."""
+    gen = RegisterCodeGenerator()
+    gen.generate(quads)
+    return gen
 
 
 # =============================================================================
@@ -346,10 +491,10 @@ class AssemblyGenerator:
     # ── full assembly text (with .data + .code sections) ───────────────
     def to_text(self) -> str:
         lines = []
-        lines.append("; ============================================")
-        lines.append(";  Crystal Compiler — Generated x86 Assembly")
-        lines.append(";  (MASM / emu8086 style, accumulator model)")
-        lines.append("; ============================================")
+        lines.append("")
+        lines.append("  ")
+        lines.append("")
+        lines.append("")
         lines.append("")
         lines.append(".MODEL SMALL")
         lines.append(".STACK 100H")
@@ -520,6 +665,68 @@ class AssemblySimulator:
             "memory": dict(self.mem),
             "steps": steps,
         }
+
+
+# =============================================================================
+# PEEPHOLE OPTIMIZATION  —  local target-code cleanup
+# =============================================================================
+def peephole(code):
+    """
+    Patterns removed:
+      1. Redundant reload    MOV x, AX ; MOV AX, x      → drop the reload
+      2. Dead load           MOV AX, a ; MOV AX, b      → drop the first
+      3. Self-move           MOV r, r                   → drop
+      4. Jump to next        JMP L ; L:                 → drop the JMP
+
+    Returns (new_code, log) where log is a list of human-readable changes.
+    """
+    code = list(code)
+    log  = []
+
+    changed = True
+    while changed:
+        changed = False
+        # indices of "significant" lines (instructions + labels)
+        sig = [i for i, a in enumerate(code) if a.kind in ("instr", "label")]
+
+        for s in range(len(sig) - 1):
+            i, j = sig[s], sig[s + 1]
+            A, B = code[i], code[j]
+
+            # 3 — self move  MOV r, r
+            if A.kind == "instr" and A.mnem == "MOV" and len(A.args) == 2 \
+                    and A.args[0] == A.args[1]:
+                log.append(f"removed  {A.render().strip()}   (self-move)")
+                del code[i]; changed = True; break
+
+            # 4 — JMP L ; L:
+            if A.kind == "instr" and A.mnem == "JMP" and B.kind == "label" \
+                    and A.args and A.args[0] == B.label:
+                log.append(f"removed  {A.render().strip()}   (jump to next line)")
+                del code[i]; changed = True; break
+
+            if A.kind != "instr" or B.kind != "instr":
+                continue
+
+            # 1 — redundant reload  MOV x,AX ; MOV AX,x
+            if A.mnem == "MOV" and B.mnem == "MOV" \
+                    and len(A.args) == 2 and len(B.args) == 2 \
+                    and A.args[1] == "AX" and B.args[0] == "AX" \
+                    and A.args[0] == B.args[1]:
+                log.append(f"removed  {B.render().strip()}   "
+                           f"(AX already holds {A.args[0]})")
+                del code[j]; changed = True; break
+
+            # 2 — dead load  MOV AX,a ; MOV AX,b   (b does not read AX)
+            if A.mnem == "MOV" and B.mnem == "MOV" \
+                    and len(A.args) == 2 and len(B.args) == 2 \
+                    and A.args[0] == "AX" and B.args[0] == "AX" \
+                    and B.args[1] != "AX":
+                log.append(f"removed  {A.render().strip()}   "
+                           f"(AX overwritten before use)")
+                del code[i]; changed = True; break
+
+    return code, log
 
 
 # =============================================================================

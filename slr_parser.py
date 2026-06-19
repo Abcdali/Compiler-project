@@ -1,6 +1,4 @@
-# =============================================================================
-# slr_parser.py  —  SLR(1) parser for Crystal language
-# =============================================================================
+
 
 from parser_rules import GrammarEngine
 
@@ -29,7 +27,6 @@ def lr0_parse(tokens):
     return engine.lr_parse(tokens, mode="LR0")
 
 
-# ── Quick test ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import lexer
     code = 'integer x equalto 5 semi'

@@ -2,9 +2,9 @@ import re
 
 
 def lexer(code: str):
-    # Remove block comments  /- ... -/
+
     code = re.sub(r'/-.*?-/', lambda m: ' ' * len(m.group()), code, flags=re.DOTALL)
-    # Remove line comments  /// ...
+
     code = re.sub(r'///.*', lambda m: ' ' * len(m.group()), code)
 
     keywords = {
@@ -47,36 +47,33 @@ def lexer(code: str):
 
     tokens = []
     lines  = code.split('\n')
-    error_found = False   # stop tokenising at the first lexical error
+    error_found = False 
 
     for line_no, line_text in enumerate(lines, start=1):
         if error_found:
             break
-        # Tokenise one line at a time so we have accurate line numbers.
-        # First, protect string literals.
+
         string_map = {}
 
         def replace_string(m):
             key = f"__STR{len(string_map)}__"
-            # pad to same length so column positions stay correct
+        
             string_map[key] = m.group(0)
             return key + ' ' * (len(m.group(0)) - len(key))
 
         safe_line = re.sub(r'"[^"]*"', replace_string, line_text)
 
-        # Pad the '==' operator first so 'a==b' splits correctly
+      
         safe_line = safe_line.replace('==', ' == ')
-        # Pad double-char delimiters
+     
         for tok in ('((', '))', '{{', '}}', '[[', ']]'):
             safe_line = safe_line.replace(tok, f' {tok} ')
 
-        # Find every word with its column
+
         for m in re.finditer(r'\S+', safe_line):
             w   = m.group()
-            col = m.start() + 1          # 1-based column
+            col = m.start() + 1         
 
-            # A protected string literal appears as its placeholder key
-            # (e.g. "__STR0__"); restore it to a real STRING token.
             key = w.rstrip()
             if key in string_map:
                 tokens.append({
@@ -135,8 +132,7 @@ def lexer(code: str):
                                 "category": "DELIMITER", "line": line_no, "col": col})
 
             else:
-                # Lexical error: record it and stop — tokens that appear
-                # AFTER the error are not produced (normal lexer behaviour).
+
                 tokens.append({
                     "type":     "LEX_ERROR",
                     "value":    w,
@@ -190,7 +186,6 @@ def syntax_errors(tokens):
                                   f"found '{v}'"),
                     })
 
-    # Anything still open was never closed.
     for top in stack:
         errors.append({
             "kind": "Syntax", "line": top.get("line"), "col": top.get("col"),
@@ -213,7 +208,7 @@ def semantic_errors(tokens):
     datatype_keywords = {"integer", "word", "decimal", "character", "logic"}
     n = len(tokens)
     errors   = []
-    declared = {}        # name -> token where it was first declared
+    declared = {}      
 
     def is_declaration(i):
         """True if the identifier at index i is in a declaring position."""
@@ -221,7 +216,6 @@ def semantic_errors(tokens):
         nxt  = tokens[i + 1]["value"]        if i + 1 < n else ""
         return prev in datatype_keywords or prev == "fun" or nxt == ":"
 
-    # Pass 1 — collect declarations and flag redeclarations.
     for i, tok in enumerate(tokens):
         if tok.get("category") != "IDENTIFIER":
             continue
@@ -239,7 +233,6 @@ def semantic_errors(tokens):
         else:
             declared.setdefault(name, tok)
 
-    # Pass 2 — every use must refer to a declared name.
     for i, tok in enumerate(tokens):
         if tok.get("category") != "IDENTIFIER":
             continue
@@ -276,11 +269,11 @@ def build_symbol_table(tokens):
 
     symbols   = {}
     order     = []
-    next_addr = 0x1000        # synthetic memory address counter
+    next_addr = 0x1000      
 
     brace_depth      = 0
-    current_func     = None   # name of the function we are currently inside
-    func_brace_level = None   # brace depth at which that function's body lives
+    current_func     = None  
+    func_brace_level = None   
 
     n = len(tokens)
     i = 0
@@ -290,7 +283,7 @@ def build_symbol_table(tokens):
         low = val.lower()
         cat = tok.get("category")
 
-        # ── Track scope via {{ }} braces ─────────────────────────────────
+
         if val == "{{":
             brace_depth += 1
             i += 1
@@ -303,7 +296,6 @@ def build_symbol_table(tokens):
             i += 1
             continue
 
-        # ── Return statement: attach return value to the enclosing func ──
         if low == "back" and current_func and current_func in symbols:
             parts = []
             j = i + 1
@@ -315,7 +307,6 @@ def build_symbol_table(tokens):
             i += 1
             continue
 
-        # ── Identifiers ──────────────────────────────────────────────────
         if cat == "IDENTIFIER":
             prev = tokens[i - 1]["value"].lower() if i > 0 else ""
             nxt  = tokens[i + 1]["value"]        if i + 1 < n else ""
@@ -325,21 +316,20 @@ def build_symbol_table(tokens):
                     (f"local ({current_func})" if current_func else "local")
 
             if prev == "fun":
-                # Function definition — its body opens one brace level deeper.
                 kind, dtype = "function", "—"
                 scope = "global"
                 current_func, func_brace_level = val, brace_depth + 1
             elif nxt == ":":
-                # Parameter:  IDENTIFIER : Type  — belongs to the current func.
+                
                 kind  = "parameter"
                 dtype = nxt2 if nxt2 in datatype_keywords else "—"
                 if current_func:
                     scope = f"local ({current_func})"
             elif prev in datatype_keywords:
-                # Variable declaration
+               
                 kind, dtype = "variable", prev
             else:
-                kind, dtype = "use", None     # a reference/usage
+                kind, dtype = "use", None    
 
             if val not in symbols:
                 if kind == "function":
@@ -363,7 +353,7 @@ def build_symbol_table(tokens):
             else:
                 e = symbols[val]
                 e["count"] += 1
-                # Backfill data type / kind if it gets declared later.
+               
                 if e["data_type"] == "—" and dtype and dtype != "—":
                     e["data_type"] = dtype
                 if e["kind"] == "use" and kind != "use":
@@ -371,7 +361,6 @@ def build_symbol_table(tokens):
 
         i += 1
 
-    # ── Compose the final "info" string per entry ────────────────────────
     result = []
     for name in order:
         e = symbols[name]

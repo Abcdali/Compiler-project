@@ -1,27 +1,3 @@
-# =============================================================================
-# code_optimization.py  —  Machine-Independent Code Optimizer
-# =============================================================================
-# Phase: Code Optimization  (runs on the Three-Address Code from
-#         intermediate_code.py)
-#
-# Pipeline:
-#   1. Build BASIC BLOCKS          (leaders → blocks)
-#   2. Build CONTROL-FLOW GRAPH    (Program Flow Graph / PFG)
-#   3. DETECT LOOPS                (dominators → back edges → natural loops)
-#   4. Apply MACHINE-INDEPENDENT optimizations:
-#        • Constant Folding
-#        • Constant Propagation
-#        • Copy Propagation
-#        • Algebraic Simplification
-#        • Common Sub-expression Elimination (CSE)
-#        • Dead-Code Elimination
-#   5. Apply LOOP optimizations:
-#        • Loop-Invariant Code Motion
-#        • Strength Reduction
-#
-# Everything is machine-independent — no registers, no target instructions.
-# =============================================================================
-
 import copy
 from intermediate_code import Quad
 
@@ -127,13 +103,14 @@ class CodeOptimizer:
         rounds  = 0
         while changed and rounds < 10:
             rounds += 1
+            c0 = self._temp_copy_elimination()
             c1 = self._constant_folding()
             c2 = self._constant_propagation()
             c3 = self._copy_propagation()
             c4 = self._algebraic_simplification()
             c5 = self._common_subexpr_elimination()
             c6 = self._dead_code_elimination()
-            changed = any([c1, c2, c3, c4, c5, c6])
+            changed = any([c0, c1, c2, c3, c4, c5, c6])
 
         # 5 — loop optimization (needs fresh loop info on optimized code)
         self._analyze()
@@ -374,6 +351,12 @@ class CodeOptimizer:
                 const_env.clear()
                 continue
 
+            # Keep 'display' referencing the variable — do NOT fold the final
+            # answer into it (the program should print the variable's value,
+            # not the literal constant).
+            if q.op == "display":
+                continue
+
             # Substitute known constants into args.
             if q.arg1 in const_env:
                 before = q.to_text().strip()
@@ -402,6 +385,48 @@ class CodeOptimizer:
         return changed
 
     # ================================================================== #
+    #  STEP 4b' — TEMP-COPY ELIMINATION
+    #            t = a op b ; x = t   →   x = a op b      (t = single-use temp)
+    #  Keeps the named RESULT variable and drops the throw-away temporary,
+    #  so the result lands directly in the variable the programmer wrote.
+    # ================================================================== #
+    def _temp_copy_elimination(self):
+        changed = False
+
+        def uses_of(name):
+            n = 0
+            for q in self.quads:
+                if str(q.arg1) == name:
+                    n += 1
+                if str(q.arg2) == name:
+                    n += 1
+            return n
+
+        i = 0
+        while i < len(self.quads):
+            q = self.quads[i]
+            # a pure copy  x = t  where t is a temporary
+            if (q.op == "=" and q.result is not None
+                    and q.arg1 is not None and _is_temp(str(q.arg1))):
+                t = str(q.arg1)
+                if uses_of(t) == 1:                       # t used only here
+                    # find the (single) instruction that defines t
+                    defq = None
+                    for d in self.quads[:i]:
+                        if d.result == t and d.op in DEF_OPS:
+                            defq = d
+                    if defq is not None:
+                        before = f"{defq.to_text().strip()} ; {q.to_text().strip()}"
+                        defq.result = q.result            # write straight into x
+                        self.quads.pop(i)                 # drop the copy
+                        self._log("Temp-Copy Elimination",
+                                  f"{before}   →   {defq.to_text().strip()}")
+                        changed = True
+                        continue
+            i += 1
+        return changed
+
+    # ================================================================== #
     #  STEP 4c — COPY PROPAGATION   (x = y; z = x → z = y)
     # ================================================================== #
     def _copy_propagation(self):
@@ -413,6 +438,9 @@ class CodeOptimizer:
                 if q.op in ("if", "ifFalse") and q.arg1 in copy_env:
                     q.arg1 = copy_env[q.arg1]; changed = True
                 copy_env.clear()
+                continue
+
+            if q.op == "display":          # keep display referencing the variable
                 continue
 
             if q.arg1 in copy_env:
