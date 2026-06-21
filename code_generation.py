@@ -1,8 +1,4 @@
-
-
 from intermediate_code import Quad
-
-
 BIN_ASM = {
     "+": "ADD", "-": "SUB", "*": "MUL",
     "/": "DIV", "%": "MOD", "**": "POW",

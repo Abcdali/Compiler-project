@@ -201,25 +201,26 @@ def semantic_errors(tokens):
     """
     Phase 3 — Semantic errors (token-level).
 
-    Detects two classic semantic problems:
-      - use of an identifier that was never declared, and
-      - redeclaration of an already-declared variable.
+    Detects:
+      - use of an identifier that was never declared,
+      - redeclaration of an already-declared variable, and
+      - TYPE MISMATCH:  assigning a value of the wrong type to a variable
+        (e.g.  integer a equalto "hi" semi   or   word w equalto 5 semi).
     """
     datatype_keywords = {"integer", "word", "decimal", "character", "logic"}
     n = len(tokens)
-    errors   = []
-    declared = {}      
+    errors        = []
+    declared      = {}      # name -> first declaration token
+    declared_type = {}      # name -> its declared data type
 
     def is_declaration(i):
-        """True if the identifier at index i is in a declaring position."""
         prev = tokens[i - 1]["value"].lower() if i > 0 else ""
         nxt  = tokens[i + 1]["value"]        if i + 1 < n else ""
         return prev in datatype_keywords or prev == "fun" or nxt == ":"
 
+    # ── Pass 1: declarations + redeclaration, remember each var's type ──
     for i, tok in enumerate(tokens):
-        if tok.get("category") != "IDENTIFIER":
-            continue
-        if not is_declaration(i):
+        if tok.get("category") != "IDENTIFIER" or not is_declaration(i):
             continue
         name = tok["value"]
         prev = tokens[i - 1]["value"].lower() if i > 0 else ""
@@ -232,11 +233,12 @@ def semantic_errors(tokens):
             })
         else:
             declared.setdefault(name, tok)
+            if prev in datatype_keywords:
+                declared_type.setdefault(name, prev)
 
+    # ── Pass 2: use of undeclared identifier ──
     for i, tok in enumerate(tokens):
-        if tok.get("category") != "IDENTIFIER":
-            continue
-        if is_declaration(i):
+        if tok.get("category") != "IDENTIFIER" or is_declaration(i):
             continue
         name = tok["value"]
         if name not in declared:
@@ -244,6 +246,47 @@ def semantic_errors(tokens):
                 "kind": "Semantic", "line": tok.get("line"), "col": tok.get("col"),
                 "value": name,
                 "error": f"Use of undeclared identifier '{name}'",
+            })
+
+    # ── Pass 3: type mismatch  (var equalto <single literal> semi) ──
+    def literal_type(t):
+        ty = t.get("type")
+        v  = str(t.get("value", "")).lower()
+        if ty == "NUMBER": return "integer"
+        if ty == "FLOAT":  return "decimal"
+        if ty == "STRING": return "word"
+        if v in ("yes", "no"): return "logic"
+        return None                        # identifier / expression — skip
+    compat = {
+        "integer":   {"integer"},
+        "decimal":   {"integer", "decimal"},
+        "word":      {"word"},
+        "character": {"word"},
+        "logic":     {"logic"},
+    }
+    for i, tok in enumerate(tokens):
+        if tok.get("value") != "equalto":
+            continue
+        # only a SINGLE literal between 'equalto' and 'semi'
+        if not (i + 2 < n and tokens[i + 2].get("type") == "Semi"):
+            continue
+        lit = literal_type(tokens[i + 1])
+        if lit is None:
+            continue
+        if i - 1 < 0 or tokens[i - 1].get("category") != "IDENTIFIER":
+            continue
+        vname = tokens[i - 1]["value"]
+        if i - 2 >= 0 and tokens[i - 2]["value"].lower() in datatype_keywords:
+            dtype = tokens[i - 2]["value"].lower()      # declaration
+        else:
+            dtype = declared_type.get(vname)            # assignment
+        if dtype and lit not in compat.get(dtype, {lit}):
+            errors.append({
+                "kind": "Semantic",
+                "line": tokens[i + 1].get("line"), "col": tokens[i + 1].get("col"),
+                "value": tokens[i + 1].get("value"),
+                "error": (f"Type mismatch: cannot assign {lit} value to "
+                          f"{dtype} variable '{vname}'"),
             })
 
     errors.sort(key=lambda e: (e.get("line") or 0, e.get("col") or 0))

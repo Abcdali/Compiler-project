@@ -1,5 +1,3 @@
-
-
 from intermediate_code import Quad
 
 

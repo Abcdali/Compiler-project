@@ -1,6 +1,14 @@
 
 EXAMPLES = [
 
+    ("Simple statements — decl / input / assign / display",
+     "integer a equalto 5 semi\n"
+     'word msg equalto "hi" semi\n'
+     "integer x semi\n"
+     "insrt x semi\n"
+     "x equalto a plus x mul 2 semi\n"
+     "display x semi\n"),
+
     ("Hello — display strings",
      'display "Hello World" semi\n'
      'display "Welcome to Crystal" semi\n'),

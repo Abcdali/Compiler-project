@@ -1,6 +1,5 @@
 import sys
 from collections import Counter
-
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget,
     QVBoxLayout, QHBoxLayout, QSplitter,
@@ -244,17 +243,28 @@ class TreeGraphView(QGraphicsView):
 
    
     def _top_text(self, node):
-        return str(node.name)                    
+        # Parse tree (non-annotated): a terminal leaf shows its GRAMMAR symbol
+        # (token type — NUMBER, FLOAT, IDENTIFIER, Semi, integer, ...), NOT the
+        # lexeme value. Non-terminals and the annotated tree keep node.name.
+        if (not getattr(self, "_annotated", False)
+                and not node.kids and getattr(node, "tok_type", None)):
+            return str(node.tok_type)
+        return str(node.name)
 
     def _val_text(self, node):
-        """Bottom line for annotated mode: the synthesised value (node.aval)."""
+        """Bottom line for annotated mode: the SDD attribute(s) of the node,
+        named like  X.val = 20 : integer  (val + type, as in the SDD rules)."""
         if not getattr(self, "_annotated", False):
             return ""
         av = getattr(node, "aval", None)
         if av is None or av == "":
             return ""
         s = str(av)
-        return "= " + (s if len(s) <= 18 else s[:16] + "…")
+        s = s if len(s) <= 16 else s[:14] + "…"
+        # attribute name: terminals carry .lexval, non-terminals carry .val
+        attr = "lexval" if (not node.kids and getattr(node, "tok_type", None)) else "val"
+        t = getattr(node, "stype", "") or ""
+        return f".{attr} = {s}" + (f" : {t}" if t else "")
 
     def _label_width(self, node):
         longest = max(len(self._top_text(node)), len(self._val_text(node)))
@@ -320,11 +330,8 @@ class TreeGraphView(QGraphicsView):
             vitem.setPos(node._gx - vb.width() / 2, node._gy + 1)
 
         
-        if (not self._annotated) and (not node.kids) and getattr(node, "tok_type", None):
-            cap = self._scene.addText(str(node.tok_type), QFont("Consolas", 7))
-            cap.setDefaultTextColor(QColor("#86efac"))
-            cb = cap.boundingRect()
-            cap.setPos(node._gx - cb.width() / 2, node._gy + h / 2 - 1)
+        # Parse tree shows ONLY the grammar terminal at each leaf — no lexeme
+        # value caption underneath.
 
         for k in node.kids:
             self._draw_nodes(k)
@@ -573,8 +580,9 @@ class CrystalCompilerGUI(QMainWindow):
         self.follow_btn   = btn("FOLLOW",               "#dc2626")
         self.tree_btn     = btn(" Parse Tree",        "#db6d28")
 
-        self.semantics_btn = btn(" SDD",              "#7e22ce")
+        self.semantics_btn = btn(" Semantics (SDD result)",  "#7e22ce")
         self.annot_btn     = btn(" Annotated Tree",   "#9333ea")
+        self.sddrules_btn  = btn(" SDD Rules (definition)", "#7c3aed")
 
         self.compile_btn  = btn("Three-Address Code", "#238636")
         self.dag_btn      = btn(" DAG",               "#0d9488")
@@ -591,7 +599,7 @@ class CrystalCompilerGUI(QMainWindow):
                 [self.lr0_btn, self.slr1_btn, self.clr1_btn, self.ll1_btn,
                  self.first_btn, self.follow_btn, self.tree_btn]),
             ("3 · Semantic",     "#7e22ce",
-                [self.semantics_btn, self.annot_btn]),
+                [self.semantics_btn, self.annot_btn, self.sddrules_btn]),
             ("4 · Intermediate", "#238636",
                 [self.compile_btn, self.dag_btn, self.backpatch_btn]),
             ("5 · Optimization", "#be123c",
@@ -850,7 +858,7 @@ class CrystalCompilerGUI(QMainWindow):
         annot_layout = QVBoxLayout(self.annot_tab)
         annot_layout.setContentsMargins(6, 6, 6, 6)
 
-        self.annot_label = QLabel(" Semantic Annotated Parse Tree — graphical, with VALUES")
+        self.annot_label = QLabel(" Semantic Annotated Tree — node.attribute = value : type")
         self.annot_label.setStyleSheet(
             "font-size:13px;font-weight:bold;color:#c084fc;padding-bottom:4px;"
         )
@@ -863,6 +871,20 @@ class CrystalCompilerGUI(QMainWindow):
         self.annot_graph = TreeGraphView()
         annot_layout.addWidget(self.annot_graph)
         self.tabs.addTab(self.annot_tab, " Annotated Tree")
+
+        self.sdd_tab = QWidget()
+        sdd_layout = QVBoxLayout(self.sdd_tab)
+        sdd_layout.setContentsMargins(6, 6, 6, 6)
+        self.sdd_label = QLabel(" SDD Rules — S-attributed (LR) + L-attributed (LL1)")
+        self.sdd_label.setStyleSheet(
+            "font-size:13px;font-weight:bold;color:#c084fc;padding-bottom:4px;"
+        )
+        sdd_layout.addWidget(self.sdd_label)
+        self.sdd_view = self._make_code_view(
+            "Click the SDD Rules button (Phase 3) to view the formal SDD."
+        )
+        sdd_layout.addWidget(self.sdd_view)
+        self.tabs.addTab(self.sdd_tab, " SDD Rules")
 
         sym_tab = QWidget()
         sym_layout = QVBoxLayout(sym_tab)
@@ -884,7 +906,7 @@ class CrystalCompilerGUI(QMainWindow):
         err_layout = QVBoxLayout(err_tab)
         err_layout.setContentsMargins(6, 6, 6, 6)
 
-        err_lbl = QLabel("⚠ Errors — Lexical • Syntax • Semantic")
+        err_lbl = QLabel(" Errors — Lexical • Syntax • Semantic")
         err_lbl.setStyleSheet(
             "font-size:13px;font-weight:bold;color:#f87171;padding-bottom:4px;"
         )
@@ -958,7 +980,7 @@ class CrystalCompilerGUI(QMainWindow):
         icg_split.setStretchFactor(1, 2)
         icg_split.setSizes([420, 300])
         icg_layout.addWidget(icg_split, 1)
-        self.tabs.addTab(self.icg_tab, "⚙ Intermediate Code")
+        self.tabs.addTab(self.icg_tab, "Intermediate Code")
 
         self.dag_tab = QWidget()
         dag_layout = QVBoxLayout(self.dag_tab)
@@ -1126,6 +1148,7 @@ class CrystalCompilerGUI(QMainWindow):
         # Phase 3 — Semantic
         self.semantics_btn.clicked.connect(self.run_syntax)
         self.annot_btn.clicked.connect(self.run_annot)
+        self.sddrules_btn.clicked.connect(self.show_sdd_rules)
         # Phase 4 — Intermediate Code
         self.compile_btn.clicked.connect(self.run_icg)
         self.dag_btn.clicked.connect(self.run_dag)
@@ -1236,10 +1259,6 @@ class CrystalCompilerGUI(QMainWindow):
             f"{title} Parse Table — {n_states} states —{conflict_info}"
         )
         self.tabs.setCurrentIndex(1)
-
-    # =========================================================================
-    # DFA DISPLAY  (canonical collection of LR item sets + transitions)
-    # =========================================================================
 
     def _clear_dfa(self, title=""):
         """Non-LR mode with no automaton to show — explanatory note."""
@@ -1360,7 +1379,7 @@ class CrystalCompilerGUI(QMainWindow):
 
         lines = []
         for i, state in enumerate(states):
-            # Sort items: kernel first (dot > 0 or augmented start), then by name.
+          
             items = sorted(
                 state,
                 key=lambda it: (not (it.dot > 0 or it.lhs.endswith("'")),
@@ -1378,7 +1397,6 @@ class CrystalCompilerGUI(QMainWindow):
                     f'{self._format_item(it, show_la)}</div>'
                 )
 
-            # Transitions out of this state.
             for sym, dst in sorted(out.get(i, [])):
                 lines.append(
                     f'<div style="margin:0 0 0 30px;line-height:1.4;">'
@@ -1437,9 +1455,6 @@ class CrystalCompilerGUI(QMainWindow):
         self.parse_table_label.setText(f"{title} Parse Table")
         self.tabs.setCurrentIndex(1)
 
-    # =========================================================================
-    # ERROR HIGHLIGHT HELPERS
-    # =========================================================================
 
     def _clear_highlights(self):
         """Remove all extra formatting from the editor."""
@@ -1473,7 +1488,7 @@ class CrystalCompilerGUI(QMainWindow):
         cursor = QTextCursor(block)
         cursor.select(QTextCursor.SelectionType.LineUnderCursor)
 
-        # Red background + red wavy underline
+
         fmt = QTextCharFormat()
         fmt.setBackground(QColor("#3b0f0f"))
         fmt.setUnderlineColor(QColor("#f87171"))
@@ -1496,6 +1511,7 @@ class CrystalCompilerGUI(QMainWindow):
 
         # Show in tree view as styled error card
         loc = f"Line {line}, Col {col}" if line not in (None, "?") else "Unknown location"
+
         html = f"""
         <div style="font-family:Consolas,'Courier New',monospace;
                     font-size:13px; background:#0d1117; padding:16px;">
@@ -1681,6 +1697,75 @@ class CrystalCompilerGUI(QMainWindow):
     def run_ll1(self):    self._start_worker("LL1")
     def run_syntax(self): self._start_worker("SYNTAX")
     def run_annot(self):  self._start_worker("ANNOT")
+
+    def show_sdd_rules(self):
+        """Render the formal SDD specification (sdd_rules.py) into its tab."""
+        import sdd_rules as sdd
+
+        def esc(x):
+            return (str(x).replace("&", "&amp;")
+                          .replace("<", "&lt;").replace(">", "&gt;"))
+
+        def head(t, c):
+            return (f'<div style="color:{c};font-weight:bold;font-size:14px;'
+                    f'margin:14px 0 6px 0;border-bottom:1px solid #1e293b;'
+                    f'padding-bottom:3px;">{esc(t)}</div>')
+
+        out = []
+        out.append('<div style="color:#a78bfa;font-weight:bold;font-size:15px;'
+                   'margin-bottom:4px;">SYNTAX-DIRECTED DEFINITIONS (SDD)</div>')
+        out.append('<div style="color:#64748b;margin-bottom:6px;">'
+                   'Running engine = semantic.py (L-attributed) &nbsp;•&nbsp; '
+                   'this reference = both styles for all 4 parsers.</div>')
+
+        # 1. Attributes
+        out.append(head("1)  ATTRIBUTES  (non-terminal : kind)", "#22d3ee"))
+        for nt, attrs in sdd.ATTRIBUTES.items():
+            parts = []
+            for n, k in attrs:
+                col = "#fb923c" if k == "inherited" else "#4ade80"
+                parts.append(f'<span style="color:{col};">{esc(n)} ({esc(k)})</span>')
+            out.append(f'<div style="margin-left:12px;">'
+                       f'<span style="color:#67e8f9;font-weight:bold;">{esc(nt)}</span>'
+                       f'<span style="color:#475569;"> : </span>{", ".join(parts)}</div>')
+
+        # 2. S-attributed
+        out.append(head("2)  S-ATTRIBUTED SDD  —  LR(0) / SLR(1) / CLR(1) (bottom-up)",
+                        "#4ade80"))
+        for prod, rules in sdd.S_ATTRIBUTED_SDD:
+            out.append(f'<div style="margin-top:5px;color:#a5f3fc;font-weight:bold;">'
+                       f'{esc(prod)}</div>')
+            for r in rules:
+                out.append(f'<div style="margin-left:22px;color:#86efac;">'
+                           f'{{ {esc(r)} }}</div>')
+
+        # 3. L-attributed
+        out.append(head("3)  L-ATTRIBUTED SDD  —  LL(1) (top-down)", "#fb923c"))
+        for prod, rules in sdd.L_ATTRIBUTED_SDD:
+            out.append(f'<div style="margin-top:5px;color:#a5f3fc;font-weight:bold;">'
+                       f'{esc(prod)}</div>')
+            for r in rules:
+                out.append(f'<div style="margin-left:22px;color:#fdba74;">'
+                           f'{{ {esc(r)} }}</div>')
+
+        # 4. Parser mapping
+        out.append(head("4)  WHICH PARSER USES WHICH SDD", "#c084fc"))
+        for p, desc in sdd.PARSER_APPLICABILITY.items():
+            out.append(f'<div style="margin-left:12px;margin-top:3px;">'
+                       f'<span style="color:#facc15;font-weight:bold;">{esc(p)}</span>'
+                       f'<span style="color:#94a3b8;"> — {esc(desc)}</span></div>')
+
+        body = "\n".join(out)
+        html = ('<div style="font-family:Consolas,monospace;'
+                'font-size:12px;line-height:1.5;background:#0d1117;">'
+                + body + "</div>")
+        self.sdd_view.setHtml(html)
+        self.sdd_view.verticalScrollBar().setValue(0)
+        idx = self.tabs.indexOf(self.sdd_tab)
+        if idx != -1:
+            self.tabs.setCurrentIndex(idx)
+        self.status.showMessage("SDD Rules shown — S-attributed (LR) + L-attributed (LL1)")
+
     def run_icg(self):    self._start_worker("ICG")
     def run_dag(self):    self._start_worker("DAG")
     def run_backpatch(self): self._start_worker("BACKPATCH")
@@ -2209,13 +2294,22 @@ class CrystalCompilerGUI(QMainWindow):
                 )
         self.summary_layout.addStretch()
 
-        # Symbol table is built from the valid tokens.
-        self._show_symbol_table(tokens)
-
         # Collect Lexical + Syntax + Semantic errors and show them together.
         errors = self._collect_errors(all_tokens, tokens)
         self._show_errors(errors)
 
+        # Symbol table is generated ONLY when the program has NO errors.
+        # If any error exists, the symbol table is not built.
+        if errors:
+            self._clear_symbol_table(
+                f"Symbol table not generated — fix the {len(errors)} error(s) "
+                f"in the ⚠ Errors tab first."
+            )
+        else:
+            self._show_symbol_table(tokens)
+
+        # Always clear the old red highlight; re-highlight only if errors remain.
+        self._clear_highlights()
         if not live:
             self.tabs.setCurrentIndex(0)
             if errors:
@@ -2305,6 +2399,7 @@ class CrystalCompilerGUI(QMainWindow):
         symbols = lexer_mod.build_symbol_table(tokens)
 
         self.symbol_table.clearContents()
+        self.symbol_table.clearSpans()        # remove any span left by the error note
         self.symbol_table.setColumnCount(4)
         self.symbol_table.setHorizontalHeaderLabels(
             ["Name", "Data Type", "Scope", "Additional Info"]
@@ -2331,6 +2426,24 @@ class CrystalCompilerGUI(QMainWindow):
                     item.setFont(f)
                 self.symbol_table.setItem(row, col, item)
 
+        self.symbol_table.resizeColumnsToContents()
+        self.symbol_table.horizontalHeader().setStretchLastSection(True)
+
+    def _clear_symbol_table(self, reason: str):
+        """Empty the symbol table — used when the program has errors so the
+        symbol table is NOT generated."""
+        self.symbol_table.clearContents()
+        self.symbol_table.clearSpans()
+        self.symbol_table.setColumnCount(4)
+        self.symbol_table.setHorizontalHeaderLabels(
+            ["Name", "Data Type", "Scope", "Additional Info"]
+        )
+        self.symbol_table.setRowCount(1)
+        item = QTableWidgetItem("⚠ " + reason)
+        item.setForeground(QColor("#fca5a5"))
+        item.setBackground(QColor(DARK_BG))
+        self.symbol_table.setItem(0, 0, item)
+        self.symbol_table.setSpan(0, 0, 1, 4)        # span across all columns
         self.symbol_table.resizeColumnsToContents()
         self.symbol_table.horizontalHeader().setStretchLastSection(True)
 

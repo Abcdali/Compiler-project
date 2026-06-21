@@ -8,7 +8,6 @@ _REL = {
     "is_less=":"<=", "is_grtr=": ">=",
 }
 
-
 class BPInstr:
     """One quad. Jump instructions carry a (possibly unfilled) target."""
     __slots__ = ("idx", "kind", "body", "target")

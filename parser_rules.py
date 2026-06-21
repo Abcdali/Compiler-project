@@ -67,6 +67,10 @@ class GrammarEngine:
         self.start = self.g.start
         self._first  = None
         self._follow = None
+        # Default grammar shares the fast class-level cache; a CUSTOM grammar
+        # (e.g. the separate LR(0) grammar) gets its own private cache so its
+        # tables never collide with the full grammar's cached tables.
+        self._cache = GrammarEngine._CACHE if rules is None else {}
 
       
         self.aug_start = self.start + "'"
@@ -168,8 +172,8 @@ class GrammarEngine:
         return states, transitions
 
     def build_lr0_table(self):
-        if "lr0" in GrammarEngine._CACHE:
-            return GrammarEngine._CACHE["lr0"]
+        if "lr0" in self._cache:
+            return self._cache["lr0"]
         states, trans = self.build_lr0_automaton()
         follow = self.follow_sets()
         ACTION = {}
@@ -204,12 +208,12 @@ class GrammarEngine:
                                 conflicts.append(f"LR(0) conflict at state {i} on '{t}'")
                             ACTION[key] = entry
 
-        GrammarEngine._CACHE["lr0"] = (ACTION, GOTO, states, trans, conflicts)
+        self._cache["lr0"] = (ACTION, GOTO, states, trans, conflicts)
         return ACTION, GOTO, states, trans, conflicts
 
     def build_slr_table(self):
-        if "slr" in GrammarEngine._CACHE:
-            return GrammarEngine._CACHE["slr"]
+        if "slr" in self._cache:
+            return self._cache["slr"]
         states, trans = self.build_slr_automaton()
         follow = self.follow_sets()
         ACTION = {}
@@ -243,12 +247,12 @@ class GrammarEngine:
                                 conflicts.append(f"SLR conflict at state {i} on '{t}'")
                             ACTION[key] = entry
 
-        GrammarEngine._CACHE["slr"] = (ACTION, GOTO, states, trans, conflicts)
+        self._cache["slr"] = (ACTION, GOTO, states, trans, conflicts)
         return ACTION, GOTO, states, trans, conflicts
 
     def build_clr_table(self):
-        if "clr" in GrammarEngine._CACHE:
-            return GrammarEngine._CACHE["clr"]
+        if "clr" in self._cache:
+            return self._cache["clr"]
         states, trans = self.build_clr_automaton()
         ACTION = {}
         GOTO   = {}
@@ -282,7 +286,7 @@ class GrammarEngine:
                                 conflicts.append(f"CLR conflict at state {i} on '{la}'")
                             ACTION[key] = entry
 
-        GrammarEngine._CACHE["clr"] = (ACTION, GOTO, states, trans, conflicts)
+        self._cache["clr"] = (ACTION, GOTO, states, trans, conflicts)
         return ACTION, GOTO, states, trans, conflicts
 
     def lr_parse(self, tokens, mode="SLR"):
@@ -398,8 +402,8 @@ class GrammarEngine:
 
 
     def build_ll1_table(self):
-        if "ll1" in GrammarEngine._CACHE:
-            return GrammarEngine._CACHE["ll1"]
+        if "ll1" in self._cache:
+            return self._cache["ll1"]
         first  = self.first_sets()
         follow = self.follow_sets()
         table  = {}  
@@ -419,7 +423,7 @@ class GrammarEngine:
                         if key not in table:
                             table[key] = prod
 
-        GrammarEngine._CACHE["ll1"] = table
+        self._cache["ll1"] = table
         return table
 
     def ll1_parse(self, tokens):
